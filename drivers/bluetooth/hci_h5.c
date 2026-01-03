@@ -845,7 +845,7 @@ static int h5_serdev_probe(struct serdev_device *serdev)
 			devm_acpi_dev_add_driver_gpios(dev,
 						       h5->vnd->acpi_gpio_map);
 	} else {
-		data = of_device_get_match_data(dev);
+		data = device_get_match_data(dev);
 		if (!data)
 			return -ENODEV;
 
