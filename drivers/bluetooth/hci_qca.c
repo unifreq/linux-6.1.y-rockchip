@@ -28,7 +28,7 @@
 #include <linux/of.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
-#include <linux/pwrseq/consumer.h>
+// #include <linux/pwrseq/consumer.h>
 #include <linux/regulator/consumer.h>
 #include <linux/serdev.h>
 #include <linux/mutex.h>
@@ -39,6 +39,48 @@
 
 #include "hci_uart.h"
 #include "btqca.h"
+
+struct pwrseq_desc;
+
+static struct clk *devm_clk_get_optional_enabled_with_rate(struct device *dev,
+							   const char *id,
+							   unsigned long rate)
+{
+	struct clk *clk;
+	int ret;
+
+	clk = devm_clk_get_optional(dev, id);
+	if (IS_ERR(clk))
+		return clk;
+
+	if (rate)
+		clk_set_rate(clk, rate);
+
+	ret = clk_prepare_enable(clk);
+	if (ret)
+		return ERR_PTR(ret);
+
+	/* Automatically disable the clock when the driver is unloaded */
+	ret = devm_add_action_or_reset(dev, (void(*)(void *))clk_disable_unprepare, clk);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return clk;
+}
+
+static inline struct pwrseq_desc *devm_pwrseq_get(struct device *dev, const char *id)
+{
+    return NULL;
+}
+
+static inline int pwrseq_power_on(struct pwrseq_desc *pwrseq)
+{
+    return 0;
+}
+
+static inline void pwrseq_power_off(struct pwrseq_desc *pwrseq)
+{
+}
 
 /* HCI_IBS protocol messages */
 #define HCI_IBS_SLEEP_IND	0xFE
