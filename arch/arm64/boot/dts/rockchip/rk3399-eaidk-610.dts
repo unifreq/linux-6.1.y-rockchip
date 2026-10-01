@@ -304,6 +304,14 @@
 };
 
 &gpu {
+	/*
+	 * rk3399.dtsi only lists the vendor midgard compatibles. Add the mainline
+	 * ones so panfrost can bind on kernels built without CONFIG_MALI_MIDGARD;
+	 * midgard accepts the lowercase interrupt-names either way.
+	 */
+	compatible = "rockchip,rk3399-mali", "arm,mali-t860",
+		     "arm,malit860", "arm,malit86x", "arm,malit8xx",
+		     "arm,mali-midgard";
 	mali-supply = <&vdd_gpu>;
 	status = "okay";
 };
