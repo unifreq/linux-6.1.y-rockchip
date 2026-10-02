@@ -827,6 +827,12 @@
 	sd-uhs-sdr50;
 	sd-uhs-sdr104;
 	vqmmc-supply = <&vcc_sdio>;
+	/*
+	 * Not a real supply: fw_devlink turns any *-supply phandle into a
+	 * device link, so dw_mmc defers until rockchip-iodomain has probed and
+	 * can flip the sdmmc pads to 1.8V during the UHS voltage switch.
+	 */
+	iodomain-supply = <&io_domains>;
 	status = "okay";
 };
 
