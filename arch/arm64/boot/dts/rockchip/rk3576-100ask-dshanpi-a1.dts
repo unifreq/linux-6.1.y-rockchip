@@ -258,6 +258,16 @@
 			linux,cma-default;
 		};
 
+		drm_logo: drm-logo@0 {
+			compatible = "rockchip,drm-logo";
+			reg = <0x0 0x0 0x0 0x0>;
+		};
+
+		drm_cubic_lut: drm-cubic-lut@0 {
+			compatible = "rockchip,drm-cubic-lut";
+			reg = <0x0 0x0 0x0 0x0>;
+		};
+
 		ramoops: ramoops@40110000 {
 			compatible = "ramoops";
 			/* 0x40110000 to 0x401f0000 is for ramoops */
@@ -513,6 +523,9 @@
 &display_subsystem {
 	clocks = <&hdptxphy>;
 	clock-names = "hdmi0_phy_pll";
+	devfreq = <&dmc>;
+	memory-region = <&drm_logo>, <&drm_cubic_lut>;
+	memory-region-names = "drm-logo", "drm-cubic-lut";
 };
 
 &dmc {
