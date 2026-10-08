@@ -535,7 +535,6 @@
 /* USB3.1_OTG/DP1.4 Combo PHY0 */
 &usbdp_phy0 {
 	status = "okay";
-	rockchip,dp-lane-mux = < 0 1 2 3 >;
 	orientation-switch;
 	svid = <0xff01>;
 	sbu1-dc-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_HIGH>;

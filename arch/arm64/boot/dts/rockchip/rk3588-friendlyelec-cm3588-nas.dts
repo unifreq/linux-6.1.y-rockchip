@@ -692,7 +692,6 @@
 
 &usbdp_phy0 {
 	orientation-switch;
-	rockchip,dp-lane-mux = <0 1 2 3 >;
 	svid = <0xff01>;
 	sbu1-dc-gpios = <&gpio4 RK_PA6 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio4 RK_PA7 GPIO_ACTIVE_HIGH>;

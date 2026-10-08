@@ -986,7 +986,6 @@
 &usbdp_phy0 {
 	status = "okay";
     orientation-switch;
-	rockchip,dp-lane-mux = <0 1 2 3 >;
     svid = <0xff01>;
 	// sbu1-dc-gpios = <0xf4 0x08 0x00>;
     sbu1-dc-gpios = <&gpio3 RK_PB0 GPIO_ACTIVE_HIGH>;

@@ -1107,8 +1107,6 @@
 	status = "okay";
 	orientation-switch;
 
-	rockchip,dp-lane-mux = < 2 3 >;
-
 	svid = <0xff01>;
 	sbu1-dc-gpios = <&gpio0 RK_PC6 GPIO_ACTIVE_HIGH>;
 	sbu2-dc-gpios = <&gpio0 RK_PD3 GPIO_ACTIVE_HIGH>;
