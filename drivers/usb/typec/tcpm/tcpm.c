@@ -351,6 +351,15 @@ struct tcpm_port {
 	int try_role;
 	int try_snk_count;
 	int try_src_count;
+	/*
+	 * Bounded number of CC re-checks performed while toggling without a
+	 * partner. Needed because a partner already attached when toggling
+	 * starts (e.g. a Type-C DP dongle present at boot) does not generate
+	 * a CC change interrupt. If its attach was seen during
+	 * PORT_RESET_WAIT_OFF (which ignores CC changes), the port would
+	 * otherwise stay in TOGGLING until a manual re-plug.
+	 */
+	u8 unattached_cc_retries;
 
 	enum pd_msg_request queued_message;
 
@@ -4044,6 +4053,57 @@ static void tcpm_set_initial_svdm_version(struct tcpm_port *port)
 	}
 }
 
+static void _tcpm_cc_change(struct tcpm_port *port, enum typec_cc_status cc1,
+			    enum typec_cc_status cc2);
+
+/*
+ * Re-read the CC lines after a port entered its unattached state.
+ *
+ * A port that does not toggle the CC lines (it is not a DRP, or the TCPC
+ * has no toggling support) relies solely on CC change interrupts to detect
+ * a partner. A partner that was already attached when the state was entered
+ * does not generate a new interrupt; worse, its attach may have been seen
+ * while CC changes were ignored (e.g. during PORT_RESET_WAIT_OFF), in which
+ * case the port stays unattached until a manual re-plug. Re-read CC here so
+ * such a partner (e.g. a Type-C DP dongle connected during boot) is detected
+ * without one. A few bounded retries absorb the time the TCPC needs to
+ * settle after its role/CC registers were (re)programmed.
+ *
+ * Returns true if the caller must stop running the state machine, i.e. a
+ * partner was found (_tcpm_cc_change() has already moved the state) or a
+ * delayed retry has been scheduled. Returns false when nothing was found
+ * and the retry budget is exhausted.
+ */
+static bool tcpm_recheck_cc_unattached(struct tcpm_port *port)
+{
+	enum typec_cc_status cc1, cc2;
+
+	if (port->tcpc->get_cc(port->tcpc, &cc1, &cc2))
+		return false;
+
+	if (cc1 != TYPEC_CC_OPEN || cc2 != TYPEC_CC_OPEN) {
+		port->unattached_cc_retries = 0;
+		dev_info(port->dev,
+			 "usbdp: unattached CC re-check cc1=%u cc2=%u\n",
+			 cc1, cc2);
+		_tcpm_cc_change(port, cc1, cc2);
+		return true;
+	}
+
+	if (port->unattached_cc_retries < 30) {
+		port->unattached_cc_retries++;
+		if (port->unattached_cc_retries == 1 ||
+		    port->unattached_cc_retries == 30)
+			dev_info(port->dev,
+				 "usbdp: no partner, CC re-check %u/30\n",
+				 port->unattached_cc_retries);
+		tcpm_set_state(port, port->state, PD_T_CC_DEBOUNCE);
+		return true;
+	}
+
+	return false;
+}
+
 static void run_state_machine(struct tcpm_port *port)
 {
 	int ret;
@@ -4054,6 +4114,16 @@ static void run_state_machine(struct tcpm_port *port)
 	port->enter_state = port->state;
 	switch (port->state) {
 	case TOGGLING:
+		/*
+		 * A partner that is already attached before toggling starts
+		 * does not generate a new CC change event. If its initial
+		 * attach fell into the PORT_RESET_WAIT_OFF window (which
+		 * ignores CC changes), the port would otherwise stay in
+		 * TOGGLING until a manual re-plug. Re-read the CC state to
+		 * catch such a partner (e.g. a Type-C DP dongle connected
+		 * during boot).
+		 */
+		tcpm_recheck_cc_unattached(port);
 		break;
 	/* SRC states */
 	case SRC_UNATTACHED:
@@ -4061,10 +4131,18 @@ static void run_state_machine(struct tcpm_port *port)
 			tcpm_swap_complete(port, -ENOTCONN);
 		tcpm_src_detach(port);
 		if (tcpm_start_toggling(port, tcpm_rp_cc(port))) {
+			port->unattached_cc_retries = 0;
 			tcpm_set_state(port, TOGGLING, 0);
 			break;
 		}
 		tcpm_set_cc(port, tcpm_rp_cc(port));
+		/*
+		 * A fixed-role source does not toggle the CC lines, so a
+		 * partner already attached when this state was entered must
+		 * be found by re-reading CC here (see the helper).
+		 */
+		if (tcpm_recheck_cc_unattached(port))
+			break;
 		if (port->port_type == TYPEC_PORT_DRP)
 			tcpm_set_state(port, SNK_UNATTACHED, PD_T_DRP_SNK);
 		break;
@@ -4300,10 +4378,18 @@ static void run_state_machine(struct tcpm_port *port)
 		tcpm_pps_complete(port, -ENOTCONN);
 		tcpm_snk_detach(port);
 		if (tcpm_start_toggling(port, TYPEC_CC_RD)) {
+			port->unattached_cc_retries = 0;
 			tcpm_set_state(port, TOGGLING, 0);
 			break;
 		}
 		tcpm_set_cc(port, TYPEC_CC_RD);
+		/*
+		 * A fixed-role sink does not toggle the CC lines, so a
+		 * partner already attached when this state was entered must
+		 * be found by re-reading CC here (see the helper).
+		 */
+		if (tcpm_recheck_cc_unattached(port))
+			break;
 		if (port->port_type == TYPEC_PORT_DRP)
 			tcpm_set_state(port, SRC_UNATTACHED, PD_T_DRP_SRC);
 		break;
