@@ -3565,7 +3565,7 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
 
 	if (!status) {
 		regmap_read(dp->regmap, DPTX_AUX_STATUS, &value);
-		dev_dbg(dp->dev, "AUX timeout after recovery: cmd=0x%x addr=0x%x size=%d, AUX_STATUS=0x%x\n",
+		dev_dbg(dp->dev, "AUX timeout after recovery: cmd=0x%x addr=0x%x size=%zu, AUX_STATUS=0x%x\n",
 			msg->request, msg->address, msg->size, value);
 		dw_dp_aux_reset(dp);
 		ret = -ETIMEDOUT;
