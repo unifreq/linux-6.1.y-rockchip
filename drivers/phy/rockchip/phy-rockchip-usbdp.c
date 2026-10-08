@@ -1514,6 +1514,22 @@ static int usbdp_typec_mux_set(struct typec_mux_dev *mux,
 				data->status, data->conf, state->mode);
 
 		if (!data || state->mode < TYPEC_STATE_MODAL) {
+			/*
+			 * The connector is not (or no longer) in the DP
+			 * alternate mode. Deassert HPD and hand the shared
+			 * lanes back to USB3, otherwise the PHY keeps the
+			 * last DP lane configuration and switching from DP
+			 * back to USB (or entering USB-only mode) fails.
+			 */
+			udphy->lane_mux_sel[0] = PHY_LANE_MUX_USB;
+			udphy->lane_mux_sel[1] = PHY_LANE_MUX_USB;
+			udphy->lane_mux_sel[2] = PHY_LANE_MUX_USB;
+			udphy->lane_mux_sel[3] = PHY_LANE_MUX_USB;
+			udphy->dp_lanes = 0;
+			if (udphy->mode != UDPHY_MODE_USB) {
+				udphy->mode = UDPHY_MODE_USB;
+				udphy->mode_change = true;
+			}
 			udphy_dp_hpd_event_trigger(udphy, false);
 		} else if (data->status & DP_STATUS_IRQ_HPD) {
 			udphy_dp_hpd_event_trigger(udphy, false);
