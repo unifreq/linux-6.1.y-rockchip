@@ -4989,6 +4989,14 @@ static bool dw_dp_detect_dpcd(struct dw_dp *dp)
 	if (ret)
 		goto fail_power_on;
 
+	/*
+	 * After (runtime) resume / HPD the AUX block can come up stuck: the
+	 * first native AUX transfer then times out and DPCD/EDID probing
+	 * fails. Reset and re-initialise the AUX channel before first use.
+	 */
+	dw_dp_aux_reset(dp);
+	dw_dp_aux_init(dp);
+
 	ret = drm_dp_dpcd_readb(&dp->aux, DP_DPCD_REV, &value);
 	if (ret < 0) {
 		dev_err(dp->dev, "aux failed to read dpcd: %d\n", ret);
@@ -5082,6 +5090,12 @@ static struct edid *dw_dp_bridge_get_edid(struct drm_bridge *bridge,
 	ret = phy_power_on(dp->phy);
 	if (ret)
 		return NULL;
+
+	/* Re-initialise the AUX channel before reading the EDID; see
+	 * dw_dp_detect_dpcd().
+	 */
+	dw_dp_aux_reset(dp);
+	dw_dp_aux_init(dp);
 
 	edid = drm_get_edid(connector, &dp->aux.ddc);
 
