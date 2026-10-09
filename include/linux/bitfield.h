@@ -202,4 +202,31 @@ __MAKE_OP(64)
 #undef __MAKE_OP
 #undef ____MAKE_OP
 
+#define __field_prep(mask, val)						\
+	({								\
+		__auto_type __mask = (mask);				\
+		typeof(__mask) __val = (val);				\
+		(__val << (sizeof(__mask) <= 4 ?			\
+			__builtin_ctz((unsigned int)__mask) :		\
+			__builtin_ctzll((unsigned long long)__mask))) &	\
+		__mask;							\
+	})
+
+#define __field_get(mask, reg)						\
+	({								\
+		__auto_type __mask = (mask);				\
+		typeof(__mask) __reg = (reg);				\
+		(__reg & __mask) >>					\
+		(sizeof(__mask) <= 4 ?					\
+			__builtin_ctz((unsigned int)__mask) :		\
+			__builtin_ctzll((unsigned long long)__mask));	\
+	})
+
+/*
+ * Runtime-mask variants of FIELD_PREP()/FIELD_GET() for masks that are not
+ * compile-time constants (backported from mainline).
+ */
+#define field_prep(mask, val)	__field_prep(mask, val)
+#define field_get(mask, reg)	__field_get(mask, reg)
+
 #endif

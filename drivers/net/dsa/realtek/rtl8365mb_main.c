@@ -40,7 +40,8 @@
  * driver has only been tested with a fixed-link, but in principle it should not
  * matter.
  *
- * NOTE: Currently, only the RGMII interface is implemented in this driver.
+ * NOTE: Currently, only the RGMII, SGMII and HSGMII interfaces are implemented
+ * in this driver.
  *
  * The interrupt line is asserted on link UP/DOWN events. The driver creates a
  * custom irqchip to handle this interrupt and demultiplex the events by reading
@@ -94,20 +95,32 @@
 #include <linux/bitops.h>
 #include <linux/interrupt.h>
 #include <linux/irqdomain.h>
+#include <linux/mii.h>
 #include <linux/mutex.h>
 #include <linux/of_irq.h>
 #include <linux/regmap.h>
 #include <linux/if_bridge.h>
+#include <linux/if_vlan.h>
+#include <linux/phylink.h>
 
 #include "realtek.h"
+#include "realtek-smi.h"
+#include "realtek-mdio.h"
+#include "rtl83xx.h"
+#include "rtl8365mb_l2.h"
+#include "rtl8365mb_vlan.h"
 
 /* Family-specific data and limits */
 #define RTL8365MB_PHYADDRMAX		7
 #define RTL8365MB_NUM_PHYREGS		32
 #define RTL8365MB_PHYREGMAX		(RTL8365MB_NUM_PHYREGS - 1)
 #define RTL8365MB_MAX_NUM_PORTS		11
-#define RTL8365MB_MAX_NUM_EXTINTS	3
+/* Valid for the whole family except RTL8370B, which has 4160 entries.
+ * RTL8370B is mentioned in vendor code but it might not even belong
+ * to the same RTL8367C family.
+ */
 #define RTL8365MB_LEARN_LIMIT_MAX	2112
+#define RTL8365MB_MAX_NUM_EXTINTS	3
 
 /* Chip identification registers */
 #define RTL8365MB_CHIP_ID_REG		0x1300
@@ -119,6 +132,7 @@
 
 /* Chip reset register */
 #define RTL8365MB_CHIP_RESET_REG	0x1322
+#define RTL8365MB_CHIP_RESET_DW8051_MASK	0x0010
 #define RTL8365MB_CHIP_RESET_SW_MASK	0x0002
 #define RTL8365MB_CHIP_RESET_HW_MASK	0x0001
 
@@ -205,14 +219,14 @@
 #define RTL8365MB_EXT_PORT_MODE_100FX		13
 
 /* External interface mode configuration registers 0~1 */
-#define RTL8365MB_DIGITAL_INTERFACE_SELECT_REG0		0x1305 /* EXT1 */
+#define RTL8365MB_DIGITAL_INTERFACE_SELECT_REG0		0x1305 /* EXT0,EXT1 */
 #define RTL8365MB_DIGITAL_INTERFACE_SELECT_REG1		0x13C3 /* EXT2 */
 #define RTL8365MB_DIGITAL_INTERFACE_SELECT_REG(_extint) \
-		((_extint) == 1 ? RTL8365MB_DIGITAL_INTERFACE_SELECT_REG0 : \
+		((_extint) <= 1 ? RTL8365MB_DIGITAL_INTERFACE_SELECT_REG0 : \
 		 (_extint) == 2 ? RTL8365MB_DIGITAL_INTERFACE_SELECT_REG1 : \
 		 0x0)
 #define   RTL8365MB_DIGITAL_INTERFACE_SELECT_MODE_MASK(_extint) \
-		(0xF << (((_extint) % 2)))
+		(0xF << (((_extint) % 2) * 4))
 #define   RTL8365MB_DIGITAL_INTERFACE_SELECT_MODE_OFFSET(_extint) \
 		(((_extint) % 2) * 4)
 
@@ -227,6 +241,88 @@
 		 0x0)
 #define   RTL8365MB_EXT_RGMXF_RXDELAY_MASK	0x0007
 #define   RTL8365MB_EXT_RGMXF_TXDELAY_MASK	0x0008
+
+/* External interface line rate bypass register - one bit per external
+ * interface, indexed by the external port number with port 5 (the first
+ * external port) as the base. Other RTL8367 families index this register
+ * differently (e.g. the RTL8367R uses (id + 1) % 2), so this mapping only
+ * holds for the RTL8367C-style parts this driver supports.
+ */
+#define RTL8365MB_BYPASS_LINE_RATE_REG		0x03F7
+#define RTL8365MB_BYPASS_LINE_RATE_MASK(_port)	BIT((_port) - 5)
+
+/* Port 6 ingress and egress rate limiter registers. Each limit is a 19-bit
+ * value in units of 8 Kbps, split across a 16-bit LSB register (CTRL0) and a
+ * 3-bit MSB field (CTRL1). The chip resets them to 0x1FFFF; see
+ * rtl8365mb_sds_raise_rate_limits().
+ */
+#define RTL8365MB_INGRESSBW_PORT6_RATE_CTRL0_REG	0x00CF
+#define RTL8365MB_INGRESSBW_PORT6_RATE_CTRL1_REG	0x00D0
+#define   RTL8365MB_INGRESSBW_PORT6_RATE_CTRL1_MASK	0x0007
+#define RTL8365MB_PORT6_EGRESSBW_CTRL0_REG		0x0398
+#define RTL8365MB_PORT6_EGRESSBW_CTRL1_REG		0x0399
+#define   RTL8365MB_PORT6_EGRESSBW_CTRL1_MASK		0x0007
+
+/* SerDes indirect access registers */
+#define RTL8365MB_SDS_INDACS_CMD_REG		0x6600
+#define   RTL8365MB_SDS_INDACS_CMD_BUSY_MASK	0x0100
+#define   RTL8365MB_SDS_INDACS_CMD_RUN_MASK	0x0080
+#define   RTL8365MB_SDS_INDACS_CMD_WR_MASK	0x0040
+#define RTL8365MB_SDS_INDACS_ADR_REG		0x6601
+#define RTL8365MB_SDS_INDACS_DATA_REG		0x6602
+
+/* SerDes miscellaneous configuration register */
+#define RTL8365MB_SDS_MISC_REG				0x1D11
+#define   RTL8365MB_SDS_MISC_SGMII_RXFC_MASK		0x4000
+#define   RTL8365MB_SDS_MISC_SGMII_TXFC_MASK		0x2000
+#define   RTL8365MB_SDS_MISC_MAC8_SEL_HSGMII_MASK	0x0800
+#define   RTL8365MB_SDS_MISC_SGMII_FDUP_MASK		0x0400
+#define   RTL8365MB_SDS_MISC_SGMII_LINK_MASK		0x0200
+#define   RTL8365MB_SDS_MISC_SGMII_SPD_MASK		0x0180
+#define   RTL8365MB_SDS_MISC_MAC8_SEL_SGMII_MASK	0x0040
+
+/* SerDes internal registers, accessed via the SDS_INDACS registers. The BMCR
+ * data path reset holds BMCR_ANENABLE | BMCR_ISOLATE while toggling the
+ * vendor-specific low bits from phase 1 to phase 2, which triggers a data path
+ * reset and PLL resync.
+ */
+#define RTL8365MB_SDS_REG_BMCR			0x0000
+#define   RTL8365MB_SDS_BMCR_DPRST_PHASE1	(BMCR_ANENABLE | BMCR_ISOLATE | 0x1)
+#define   RTL8365MB_SDS_BMCR_DPRST_PHASE2	(BMCR_ANENABLE | BMCR_ISOLATE | 0x3)
+#define RTL8365MB_SDS_REG_NWAY			0x0002
+#define   RTL8365MB_SDS_NWAY_EN_MASK		0x0200
+#define   RTL8365MB_SDS_NWAY_RESTART_MASK	0x0100
+#define RTL8365MB_SDS_REG_RESET			0x0003
+#define   RTL8365MB_SDS_RESET_DEASSERT		0x7106
+#define RTL8365MB_SDS_REG_LINK_STATUS		0x003d
+#define   RTL8365MB_SDS_LINK_STATUS_LINK_MASK	0x0010
+
+/* The embedded SerDes can only be muxed to external interface 1 (MAC8),
+ * which is port 6.
+ */
+#define RTL8365MB_SDS_EXT_INTERFACE_ID		1
+#define RTL8365MB_SDS_EXT_INTERFACE_PORT	6
+
+/* Line rate bypass bit for the SerDes external interface */
+#define RTL8365MB_SDS_BYPASS_LINE_RATE_MASK \
+	RTL8365MB_BYPASS_LINE_RATE_MASK(RTL8365MB_SDS_EXT_INTERFACE_PORT)
+
+/* SerDes tuning parameter variant selector. The vendor driver picks between
+ * two sets of SerDes tuning parameters based on this chip option. Reading it
+ * requires first arming the read by writing a magic key to the arm register,
+ * then disarming it afterwards.
+ */
+#define RTL8365MB_SDS_OPTION_ARM_REG		0x13C0
+#define   RTL8365MB_SDS_OPTION_ARM_KEY		0x0249
+#define RTL8365MB_SDS_OPTION_REG		0x13C1
+
+/* Embedded DW8051 microcontroller control registers. The microcontroller
+ * can run firmware to manage the SerDes link, but this driver keeps it in
+ * reset and disabled: phylink already performs the link management that
+ * the firmware would otherwise do.
+ */
+#define RTL8365MB_MISC_CFG0_REG			0x130C
+#define   RTL8365MB_MISC_CFG0_DW8051_EN_MASK	0x0020
 
 /* External interface port speed values - used in DIGITAL_INTERFACE_FORCE */
 #define RTL8365MB_PORT_SPEED_10M	0
@@ -267,6 +363,7 @@
 /* Maximum packet length register */
 #define RTL8365MB_CFG0_MAX_LEN_REG	0x088C
 #define   RTL8365MB_CFG0_MAX_LEN_MASK	0x3FFF
+#define RTL8365MB_CFG0_MAX_LEN_MAX	0x3FFF
 
 /* Port learning limit registers */
 #define RTL8365MB_LUT_PORT_LEARN_LIMIT_BASE		0x0A20
@@ -279,6 +376,15 @@
 		(RTL8365MB_PORT_ISOLATION_REG_BASE + (_physport))
 #define   RTL8365MB_PORT_ISOLATION_MASK			0x07FF
 
+/* Extended filter ID registers - used to key forwarding database with IVL */
+#define RTL8365MB_EFID_MASK			GENMASK(2, 0)
+#define RTL8365MB_PORT_EFID_REG_BASE		0x0A32
+#define RTL8365MB_PORT_EFID_REG(_p) \
+		(RTL8365MB_PORT_EFID_REG_BASE + ((_p) >> 2))
+#define   RTL8365MB_PORT_EFID_OFFSET(_p)	(((_p) & 0x3) << 2)
+#define   RTL8365MB_PORT_EFID_MASK(_p) \
+		(RTL8365MB_EFID_MASK << RTL8365MB_PORT_EFID_OFFSET(_p))
+
 /* MSTP port state registers - indexed by tree instance */
 #define RTL8365MB_MSTI_CTRL_BASE			0x0A00
 #define RTL8365MB_MSTI_CTRL_REG(_msti, _physport) \
@@ -286,6 +392,72 @@
 #define   RTL8365MB_MSTI_CTRL_PORT_STATE_OFFSET(_physport) ((_physport) << 1)
 #define   RTL8365MB_MSTI_CTRL_PORT_STATE_MASK(_physport) \
 		(0x3 << RTL8365MB_MSTI_CTRL_PORT_STATE_OFFSET((_physport)))
+
+/* Unknown unicast DA flooding port mask */
+#define RTL8365MB_UNKNOWN_UNICAST_FLOODING_PMASK_REG		0x0890
+#define   RTL8365MB_UNKNOWN_UNICAST_FLOODING_PMASK_MASK		0x07FF
+
+/* Unknown multicast DA flooding port mask */
+#define RTL8365MB_UNKNOWN_MULTICAST_FLOODING_PMASK_REG		0x0891
+#define   RTL8365MB_UNKNOWN_MULTICAST_FLOODING_PMASK_MASK	0x07FF
+
+/* Broadcast flooding port mask */
+#define RTL8365MB_UNKNOWN_BROADCAST_FLOODING_PMASK_REG		0x0892
+#define   RTL8365MB_UNKNOWN_BROADCAST_FLOODING_PMASK_MASK	0x07FF
+
+#define RTL8365MB_SUPPORTED_BRIDGE_FLAGS \
+	    (BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD | BR_BCAST_FLOOD)
+
+/* Miscellaneous port configuration register, incl. VLAN egress mode */
+#define RTL8365MB_PORT_MISC_CFG_REG_BASE			0x000E
+#define RTL8365MB_PORT_MISC_CFG_REG(_p) \
+		(RTL8365MB_PORT_MISC_CFG_REG_BASE + ((_p) << 5))
+#define   RTL8365MB_PORT_MISC_CFG_SMALL_TAG_IPG_MASK		0x8000
+#define   RTL8365MB_PORT_MISC_CFG_TX_ITFSP_MODE_MASK		0x4000
+#define   RTL8365MB_PORT_MISC_CFG_FLOWCTRL_INDEP_MASK		0x2000
+#define   RTL8365MB_PORT_MISC_CFG_DOT1Q_REMARK_ENABLE_MASK	0x1000
+#define   RTL8365MB_PORT_MISC_CFG_INGRESSBW_FLOWCTRL_MASK	0x0800
+#define   RTL8365MB_PORT_MISC_CFG_INGRESSBW_IFG_MASK		0x0400
+#define   RTL8365MB_PORT_MISC_CFG_RX_SPC_MASK			0x0200
+#define   RTL8365MB_PORT_MISC_CFG_CRC_SKIP_MASK			0x0100
+#define   RTL8365MB_PORT_MISC_CFG_PKTGEN_TX_FIRST_MASK		0x0080
+#define   RTL8365MB_PORT_MISC_CFG_MAC_LOOPBACK_MASK		0x0040
+/* See &rtl8365mb_vlan_egress_mode */
+#define   RTL8365MB_PORT_MISC_CFG_VLAN_EGRESS_MODE_MASK		0x0030
+#define   RTL8365MB_PORT_MISC_CFG_CONGESTION_SUSTAIN_TIME_MASK	0x000F
+
+/**
+ * enum rtl8365mb_vlan_egress_mode - port VLAN egress mode
+ * @RTL8365MB_VLAN_EGRESS_MODE_ORIGINAL: follow untag mask in VLAN4k table entry
+ * @RTL8365MB_VLAN_EGRESS_MODE_KEEP: the VLAN tag format of egressed packets
+ * will remain the same as their ingressed format, but the priority and VID
+ * fields may be altered
+ * @RTL8365MB_VLAN_EGRESS_MODE_PRI_TAG: always egress with priority tag
+ * @RTL8365MB_VLAN_EGRESS_MODE_REAL_KEEP: the VLAN tag format of egressed
+ * packets will remain the same as their ingressed format, and neither the
+ * priority nor VID fields can be altered
+ */
+enum rtl8365mb_vlan_egress_mode {
+	RTL8365MB_VLAN_EGRESS_MODE_ORIGINAL = 0,
+	RTL8365MB_VLAN_EGRESS_MODE_KEEP = 1,
+	RTL8365MB_VLAN_EGRESS_MODE_PRI_TAG = 2,
+	RTL8365MB_VLAN_EGRESS_MODE_REAL_KEEP = 3,
+};
+
+/* VLAN control register */
+#define RTL8365MB_VLAN_CTRL_REG			0x07A8
+#define   RTL8365MB_VLAN_CTRL_EN_MASK		0x0001
+
+/* VLAN ingress filter register */
+#define RTL8365MB_VLAN_INGRESS_REG				0x07A9
+#define   RTL8365MB_VLAN_INGRESS_MASK				GENMASK(10, 0)
+#define   RTL8365MB_VLAN_INGRESS_FILTER_PORT_EN_OFFSET(_p)	(_p)
+#define   RTL8365MB_VLAN_INGRESS_FILTER_PORT_EN_MASK(_p)	BIT(_p)
+
+/* VLAN "transparent" setting registers */
+#define RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG_BASE	0x09D0
+#define RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG(_p) \
+		(RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG_BASE + (_p))
 
 /* MIB counter value registers */
 #define RTL8365MB_MIB_COUNTER_BASE	0x1000
@@ -465,6 +637,30 @@ static const struct rtl8365mb_jam_tbl_entry rtl8365mb_init_jam_common[] = {
 	{ 0x1D32, 0x0002 },
 };
 
+/* SGMII SerDes tuning parameters, lifted from the vendor driver sources. The
+ * vendor driver keeps two variants of this table and selects between them
+ * based on the chip option register; these are the values for a non-zero
+ * option, which is what RTL8367S parts seen so far report. See
+ * rtl8365mb_sds_probe_option().
+ */
+static const struct rtl8365mb_jam_tbl_entry rtl8365mb_sds_jam_sgmii[] = {
+	{ 0x0480, 0x04D7 }, { 0x0481, 0xF994 }, { 0x0482, 0x2420 },
+	{ 0x0483, 0x6960 }, { 0x0484, 0x9728 }, { 0x0423, 0x9D85 },
+	{ 0x0424, 0xD810 }, { 0x002E, 0x83F2 },
+};
+
+/* HSGMII SerDes tuning parameters, lifted from the vendor driver sources. As
+ * with the SGMII table, the vendor driver keeps several variants and selects
+ * one based on the chip option register; these are the values for a non-zero
+ * option, which is what RTL8367S parts seen so far report. See
+ * rtl8365mb_sds_probe_option().
+ */
+static const struct rtl8365mb_jam_tbl_entry rtl8365mb_sds_jam_hsgmii[] = {
+	{ 0x0500, 0x82F0 }, { 0x0501, 0xF195 }, { 0x0502, 0x31A2 },
+	{ 0x0503, 0x7960 }, { 0x0504, 0x9728 }, { 0x0423, 0x9D85 },
+	{ 0x0424, 0xD810 }, { 0x0001, 0x0F80 }, { 0x002E, 0x83F2 },
+};
+
 enum rtl8365mb_phy_interface_mode {
 	RTL8365MB_PHY_INTERFACE_MODE_INVAL = 0,
 	RTL8365MB_PHY_INTERFACE_MODE_INTERNAL = BIT(0),
@@ -533,6 +729,20 @@ static const struct rtl8365mb_chip_info rtl8365mb_chip_infos[] = {
 		.chip_ver = 0x00A0,
 		.extints = {
 			{ 6, 1, PHY_INTF(SGMII) | PHY_INTF(HSGMII) },
+			{ 7, 2, PHY_INTF(MII) | PHY_INTF(TMII) |
+				PHY_INTF(RMII) | PHY_INTF(RGMII) },
+		},
+		.jam_table = rtl8365mb_init_jam_8365mb_vc,
+		.jam_size = ARRAY_SIZE(rtl8365mb_init_jam_8365mb_vc),
+	},
+	{
+		.name = "RTL8367SB",
+		.chip_id = 0x6367,
+		.chip_ver = 0x0010,
+		.extints = {
+			{ 6, 1, PHY_INTF(MII) | PHY_INTF(TMII) |
+				PHY_INTF(RMII) | PHY_INTF(RGMII) |
+				PHY_INTF(SGMII) | PHY_INTF(HSGMII) },
 			{ 7, 2, PHY_INTF(MII) | PHY_INTF(TMII) |
 				PHY_INTF(RMII) | PHY_INTF(RGMII) },
 		},
@@ -630,6 +840,9 @@ struct rtl8365mb_port {
  * @cpu: CPU tagging and CPU port configuration for this chip
  * @mib_lock: prevent concurrent reads of MIB counters
  * @ports: per-port data
+ * @pcs: PCS for the SerDes external interface
+ * @sds_supported: SerDes tuning parameters match the chip option, so the
+ *                 SerDes interface modes can be advertised
  *
  * Private data for this driver.
  */
@@ -640,7 +853,11 @@ struct rtl8365mb {
 	struct rtl8365mb_cpu cpu;
 	struct mutex mib_lock;
 	struct rtl8365mb_port ports[RTL8365MB_MAX_NUM_PORTS];
+	struct phylink_pcs pcs;
+	bool sds_supported;
 };
+
+#define pcs_to_rtl8365mb(_pcs) container_of((_pcs), struct rtl8365mb, pcs)
 
 static int rtl8365mb_phy_poll_busy(struct realtek_priv *priv)
 {
@@ -687,7 +904,7 @@ static int rtl8365mb_phy_ocp_read(struct realtek_priv *priv, int phy,
 	u32 val;
 	int ret;
 
-	mutex_lock(&priv->map_lock);
+	rtl83xx_lock(priv);
 
 	ret = rtl8365mb_phy_poll_busy(priv);
 	if (ret)
@@ -720,7 +937,7 @@ static int rtl8365mb_phy_ocp_read(struct realtek_priv *priv, int phy,
 	*data = val & 0xFFFF;
 
 out:
-	mutex_unlock(&priv->map_lock);
+	rtl83xx_unlock(priv);
 
 	return ret;
 }
@@ -731,7 +948,7 @@ static int rtl8365mb_phy_ocp_write(struct realtek_priv *priv, int phy,
 	u32 val;
 	int ret;
 
-	mutex_lock(&priv->map_lock);
+	rtl83xx_lock(priv);
 
 	ret = rtl8365mb_phy_poll_busy(priv);
 	if (ret)
@@ -762,7 +979,7 @@ static int rtl8365mb_phy_ocp_write(struct realtek_priv *priv, int phy,
 		goto out;
 
 out:
-	mutex_unlock(&priv->map_lock);
+	rtl83xx_unlock(priv);
 
 	return ret;
 }
@@ -784,8 +1001,8 @@ static int rtl8365mb_phy_read(struct realtek_priv *priv, int phy, int regnum)
 	ret = rtl8365mb_phy_ocp_read(priv, phy, ocp_addr, &val);
 	if (ret) {
 		dev_err(priv->dev,
-			"failed to read PHY%d reg %02x @ %04x, ret %d\n", phy,
-			regnum, ocp_addr, ret);
+			"failed to read PHY%d reg %02x @ %04x, ret %pe\n", phy,
+			regnum, ocp_addr, ERR_PTR(ret));
 		return ret;
 	}
 
@@ -812,8 +1029,8 @@ static int rtl8365mb_phy_write(struct realtek_priv *priv, int phy, int regnum,
 	ret = rtl8365mb_phy_ocp_write(priv, phy, ocp_addr, val);
 	if (ret) {
 		dev_err(priv->dev,
-			"failed to write PHY%d reg %02x @ %04x, ret %d\n", phy,
-			regnum, ocp_addr, ret);
+			"failed to write PHY%d reg %02x @ %04x, ret %pe\n", phy,
+			regnum, ocp_addr, ERR_PTR(ret));
 		return ret;
 	}
 
@@ -821,17 +1038,6 @@ static int rtl8365mb_phy_write(struct realtek_priv *priv, int phy, int regnum,
 		phy, regnum, ocp_addr, val);
 
 	return 0;
-}
-
-static int rtl8365mb_dsa_phy_read(struct dsa_switch *ds, int phy, int regnum)
-{
-	return rtl8365mb_phy_read(ds->priv, phy, regnum);
-}
-
-static int rtl8365mb_dsa_phy_write(struct dsa_switch *ds, int phy, int regnum,
-				   u16 val)
-{
-	return rtl8365mb_phy_write(ds->priv, phy, regnum, val);
 }
 
 static const struct rtl8365mb_extint *
@@ -876,6 +1082,7 @@ static int rtl8365mb_ext_config_rgmii(struct realtek_priv *priv, int port,
 {
 	const struct rtl8365mb_extint *extint =
 		rtl8365mb_get_port_extint(priv, port);
+	struct dsa_switch *ds = &priv->ds;
 	struct device_node *dn;
 	struct dsa_port *dp;
 	int tx_delay = 0;
@@ -886,7 +1093,7 @@ static int rtl8365mb_ext_config_rgmii(struct realtek_priv *priv, int port,
 	if (!extint)
 		return -ENODEV;
 
-	dp = dsa_to_port(priv->ds, port);
+	dp = dsa_to_port(ds, port);
 	dn = dp->dn;
 
 	/* Set the RGMII TX/RX delay
@@ -952,6 +1159,379 @@ static int rtl8365mb_ext_config_rgmii(struct realtek_priv *priv, int port,
 	return 0;
 }
 
+static int rtl8365mb_sds_write(struct realtek_priv *priv, u16 addr, u16 data)
+{
+	int ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_DATA_REG, data);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_ADR_REG, addr);
+	if (ret)
+		return ret;
+
+	/* The SerDes indirect access engine completes the command within the
+	 * register write transaction, so there is no need to wait or poll for
+	 * completion before the next access, matching the vendor driver.
+	 */
+	return regmap_write(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
+			    RTL8365MB_SDS_INDACS_CMD_RUN_MASK |
+			    RTL8365MB_SDS_INDACS_CMD_WR_MASK);
+}
+
+static int rtl8365mb_sds_read(struct realtek_priv *priv, u16 addr, u16 *data)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_ADR_REG, addr);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
+			   RTL8365MB_SDS_INDACS_CMD_RUN_MASK);
+	if (ret)
+		return ret;
+
+	/* Wait for the indirect read to complete: the engine clears the BUSY
+	 * bit once the data register holds the result.
+	 */
+	ret = regmap_read_poll_timeout(priv->map, RTL8365MB_SDS_INDACS_CMD_REG,
+				       val,
+				       !(val & RTL8365MB_SDS_INDACS_CMD_BUSY_MASK),
+				       10, 1000);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(priv->map, RTL8365MB_SDS_INDACS_DATA_REG, &val);
+	if (ret)
+		return ret;
+
+	*data = val;
+
+	return 0;
+}
+
+/* The vendor driver selects between two sets of SerDes tuning parameters based
+ * on the chip option register. Only the variant for a non-zero option has been
+ * tested on real hardware - the RTL8367S parts seen so far all report 1. The
+ * variant for option 0 uses different tuning values that cannot be verified,
+ * so probe the option once at setup and only advertise the SerDes interface
+ * modes when the tuning parameters are known to match, so that an unsupported
+ * variant fails at phylink validation time rather than when configuring the
+ * link.
+ */
+static int rtl8365mb_sds_probe_option(struct realtek_priv *priv)
+{
+	struct rtl8365mb *mb = priv->chip_data;
+	const struct rtl8365mb_extint *extint;
+	u32 option;
+	int ret;
+	int i;
+
+	/* Nothing to probe if no external interface is wired to the SerDes */
+	for (i = 0; i < RTL8365MB_MAX_NUM_EXTINTS; i++) {
+		extint = &mb->chip_info->extints[i];
+
+		if (extint->supported_interfaces &
+		    (RTL8365MB_PHY_INTERFACE_MODE_SGMII |
+		     RTL8365MB_PHY_INTERFACE_MODE_HSGMII))
+			break;
+	}
+	if (i == RTL8365MB_MAX_NUM_EXTINTS)
+		return 0;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_OPTION_ARM_REG,
+			   RTL8365MB_SDS_OPTION_ARM_KEY);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(priv->map, RTL8365MB_SDS_OPTION_REG, &option);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_SDS_OPTION_ARM_REG, 0);
+	if (ret)
+		return ret;
+
+	if (option == 0) {
+		dev_warn(priv->dev,
+			 "unsupported SerDes tuning variant (chip option 0), disabling SerDes interface modes\n");
+		return 0;
+	}
+
+	mb->sds_supported = true;
+
+	return 0;
+}
+
+/* The vendor driver raises the port 6 ingress and egress rate limiters to
+ * their maximum in its switch init, unconditionally for the whole chip
+ * family. The chip reset in rtl8365mb_setup() puts them back to their reset
+ * default of 0x1FFFF, a ~1.048 Gbps limit which caps the aggregate
+ * throughput of an HSGMII CPU port at roughly 1 Gbps. The vendor
+ * documentation describes the reset default as disabling the limiter, but
+ * the cap has been observed on hardware. Raise them likewise, to 0x7FFFF
+ * (~4.19 Gbps, above the HSGMII line rate). The related HSGMII scheduler
+ * line rate register (LINE_RATE_HSG_H, 0x03FA) is already set to its
+ * maximum by the common init jam table.
+ */
+static int rtl8365mb_sds_raise_rate_limits(struct realtek_priv *priv)
+{
+	int ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_INGRESSBW_PORT6_RATE_CTRL0_REG,
+			   0xFFFF);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map,
+				 RTL8365MB_INGRESSBW_PORT6_RATE_CTRL1_REG,
+				 RTL8365MB_INGRESSBW_PORT6_RATE_CTRL1_MASK,
+				 RTL8365MB_INGRESSBW_PORT6_RATE_CTRL1_MASK);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->map, RTL8365MB_PORT6_EGRESSBW_CTRL0_REG,
+			   0xFFFF);
+	if (ret)
+		return ret;
+
+	return regmap_update_bits(priv->map, RTL8365MB_PORT6_EGRESSBW_CTRL1_REG,
+				  RTL8365MB_PORT6_EGRESSBW_CTRL1_MASK,
+				  RTL8365MB_PORT6_EGRESSBW_CTRL1_MASK);
+}
+
+static int rtl8365mb_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+				phy_interface_t interface,
+				const unsigned long *advertising,
+				bool permit_pause_to_mac)
+{
+	const struct rtl8365mb_jam_tbl_entry *sds_jam;
+	const int id = RTL8365MB_SDS_EXT_INTERFACE_ID;
+	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+	struct realtek_priv *priv;
+	size_t sds_jam_size;
+	u32 mode;
+	u16 val;
+	int ret;
+	int i;
+
+	priv = mb->priv;
+
+	if (interface == PHY_INTERFACE_MODE_2500BASEX) {
+		sds_jam = rtl8365mb_sds_jam_hsgmii;
+		sds_jam_size = ARRAY_SIZE(rtl8365mb_sds_jam_hsgmii);
+		mode = RTL8365MB_EXT_PORT_MODE_HSGMII;
+	} else {
+		sds_jam = rtl8365mb_sds_jam_sgmii;
+		sds_jam_size = ARRAY_SIZE(rtl8365mb_sds_jam_sgmii);
+		mode = RTL8365MB_EXT_PORT_MODE_SGMII;
+	}
+
+	/* Hold the embedded DW8051 microcontroller in reset and keep it
+	 * disabled. The vendor driver loads firmware into it to manage the
+	 * SerDes link, but the firmware only duplicates work that phylink
+	 * already does: it polls the port status and forces the external
+	 * interface configuration in the very registers this driver manages.
+	 * Letting it run would race with phylink.
+	 */
+	ret = regmap_update_bits(priv->map, RTL8365MB_CHIP_RESET_REG,
+				 RTL8365MB_CHIP_RESET_DW8051_MASK,
+				 RTL8365MB_CHIP_RESET_DW8051_MASK);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(priv->map, RTL8365MB_MISC_CFG0_REG,
+				 RTL8365MB_MISC_CFG0_DW8051_EN_MASK, 0);
+	if (ret)
+		return ret;
+
+	/* The vendor driver clears the line rate bypass for all interface
+	 * modes except TMII.
+	 */
+	ret = regmap_update_bits(priv->map, RTL8365MB_BYPASS_LINE_RATE_REG,
+				 RTL8365MB_SDS_BYPASS_LINE_RATE_MASK, 0);
+	if (ret)
+		return ret;
+
+	/* Tune the SerDes with vendor-prescribed parameters */
+	for (i = 0; i < sds_jam_size; i++) {
+		ret = rtl8365mb_sds_write(priv, sds_jam[i].reg,
+					  sds_jam[i].val);
+		if (ret)
+			return ret;
+	}
+
+	/* Mux the SerDes to MAC8 in the requested mode */
+	ret = regmap_update_bits(priv->map, RTL8365MB_SDS_MISC_REG,
+				 RTL8365MB_SDS_MISC_MAC8_SEL_SGMII_MASK |
+					 RTL8365MB_SDS_MISC_MAC8_SEL_HSGMII_MASK,
+				 mode == RTL8365MB_EXT_PORT_MODE_SGMII ?
+					 RTL8365MB_SDS_MISC_MAC8_SEL_SGMII_MASK :
+					 RTL8365MB_SDS_MISC_MAC8_SEL_HSGMII_MASK);
+	if (ret)
+		return ret;
+
+	val = mode << RTL8365MB_DIGITAL_INTERFACE_SELECT_MODE_OFFSET(id);
+	ret = regmap_update_bits(priv->map,
+				 RTL8365MB_DIGITAL_INTERFACE_SELECT_REG(id),
+				 RTL8365MB_DIGITAL_INTERFACE_SELECT_MODE_MASK(id),
+				 val);
+	if (ret)
+		return ret;
+
+	/* Take the SerDes out of reset. The vendor driver does this only
+	 * after the SerDes mux and the interface mode are configured.
+	 */
+	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_RESET,
+				  RTL8365MB_SDS_RESET_DEASSERT);
+	if (ret)
+		return ret;
+
+	/* Reset the SerDes data path and resync its PLL, mirroring what the
+	 * vendor firmware does right after deasserting the SerDes reset.
+	 * This flushes the FIFOs and ensures a clean state for the link,
+	 * preventing silent drops and CRC errors.
+	 */
+	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
+				  RTL8365MB_SDS_BMCR_DPRST_PHASE1);
+	if (ret)
+		return ret;
+
+	ret = rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_BMCR,
+				  RTL8365MB_SDS_BMCR_DPRST_PHASE2);
+	if (ret)
+		return ret;
+
+	/* Keep SGMII in-band autonegotiation disabled: the link parameters are
+	 * forced from rtl8365mb_pcs_link_up() instead.
+	 */
+	ret = rtl8365mb_sds_read(priv, RTL8365MB_SDS_REG_NWAY, &val);
+	if (ret)
+		return ret;
+
+	val &= ~RTL8365MB_SDS_NWAY_EN_MASK;
+	val |= RTL8365MB_SDS_NWAY_RESTART_MASK;
+
+	return rtl8365mb_sds_write(priv, RTL8365MB_SDS_REG_NWAY, val);
+}
+
+static bool rtl8365mb_interface_is_serdes(phy_interface_t interface)
+{
+	return interface == PHY_INTERFACE_MODE_SGMII ||
+	       interface == PHY_INTERFACE_MODE_2500BASEX;
+}
+
+static void rtl8365mb_pcs_get_state(struct phylink_pcs *pcs,
+				    struct phylink_link_state *state)
+{
+	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+	struct realtek_priv *priv = mb->priv;
+	u16 status;
+	u32 val;
+	int ret;
+
+	/* In-band autonegotiation is not implemented, so the link parameters are
+	 * forced from rtl8365mb_pcs_link_up(). The real link state must still be
+	 * read from the SerDes itself: the embedded DW8051 microcontroller that
+	 * the vendor firmware uses to poll the SerDes is kept disabled (see
+	 * rtl8365mb_pcs_config()), so the link status register can be read
+	 * directly through the SDS_INDACS window without racing the auto-poll.
+	 */
+	ret = rtl8365mb_sds_read(priv, RTL8365MB_SDS_REG_LINK_STATUS, &status);
+	if (ret) {
+		state->link = false;
+		return;
+	}
+
+	state->link = !!(status & RTL8365MB_SDS_LINK_STATUS_LINK_MASK);
+	state->an_complete = state->link;
+	if (!state->link)
+		return;
+
+	/* The speed and duplex are forced; read them back from the values
+	 * programmed into the SerDes MISC register.
+	 */
+	ret = regmap_read(priv->map, RTL8365MB_SDS_MISC_REG, &val);
+	if (ret) {
+		state->link = false;
+		return;
+	}
+
+	state->duplex = (val & RTL8365MB_SDS_MISC_SGMII_FDUP_MASK) ?
+				DUPLEX_FULL : DUPLEX_HALF;
+
+	switch (FIELD_GET(RTL8365MB_SDS_MISC_SGMII_SPD_MASK, val)) {
+	case RTL8365MB_PORT_SPEED_1000M:
+		state->speed =
+			state->interface == PHY_INTERFACE_MODE_2500BASEX ?
+				SPEED_2500 : SPEED_1000;
+		break;
+	case RTL8365MB_PORT_SPEED_100M:
+		state->speed = SPEED_100;
+		break;
+	case RTL8365MB_PORT_SPEED_10M:
+		state->speed = SPEED_10;
+		break;
+	}
+}
+
+static void rtl8365mb_pcs_link_up(struct phylink_pcs *pcs,
+				  unsigned int neg_mode,
+				  phy_interface_t interface, int speed,
+				  int duplex)
+{
+	struct rtl8365mb *mb = pcs_to_rtl8365mb(pcs);
+	struct realtek_priv *priv = mb->priv;
+	u32 mask = RTL8365MB_SDS_MISC_SGMII_FDUP_MASK |
+		   RTL8365MB_SDS_MISC_SGMII_LINK_MASK |
+		   RTL8365MB_SDS_MISC_SGMII_SPD_MASK;
+	u32 val = RTL8365MB_SDS_MISC_SGMII_LINK_MASK;
+	u32 r_speed;
+	int ret;
+
+	/* The speed field has no value for 2.5 Gbps: the rate is determined by
+	 * the HSGMII SerDes configuration, and the vendor driver programs the
+	 * 1 Gbps value here.
+	 */
+	if (speed == SPEED_2500 || speed == SPEED_1000) {
+		r_speed = RTL8365MB_PORT_SPEED_1000M;
+	} else if (speed == SPEED_100) {
+		r_speed = RTL8365MB_PORT_SPEED_100M;
+	} else if (speed == SPEED_10) {
+		r_speed = RTL8365MB_PORT_SPEED_10M;
+	} else {
+		dev_err(priv->dev, "unsupported SerDes speed %s\n",
+			phy_speed_to_str(speed));
+		return;
+	}
+
+	val |= FIELD_PREP(RTL8365MB_SDS_MISC_SGMII_SPD_MASK, r_speed);
+
+	if (duplex == DUPLEX_FULL)
+		val |= RTL8365MB_SDS_MISC_SGMII_FDUP_MASK;
+
+	/* pcs_link_up() carries no pause information, so the SerDes flow
+	 * control bits are programmed together with the MAC external interface
+	 * force from rtl8365mb_phylink_mac_link_up(), where the resolved pause
+	 * modes are known.
+	 */
+	ret = regmap_update_bits(priv->map, RTL8365MB_SDS_MISC_REG, mask, val);
+	if (ret) {
+		dev_err(priv->dev, "failed to force SerDes link: %pe\n",
+			ERR_PTR(ret));
+		return;
+	}
+}
+
+static const struct phylink_pcs_ops rtl8365mb_pcs_ops = {
+	.pcs_config = rtl8365mb_pcs_config,
+	.pcs_get_state = rtl8365mb_pcs_get_state,
+	.pcs_link_up = rtl8365mb_pcs_link_up,
+};
+
 static int rtl8365mb_ext_config_forcemode(struct realtek_priv *priv, int port,
 					  bool link, int speed, int duplex,
 					  bool tx_pause, bool rx_pause)
@@ -975,7 +1555,11 @@ static int rtl8365mb_ext_config_forcemode(struct realtek_priv *priv, int port,
 		r_rx_pause = rx_pause ? 1 : 0;
 		r_tx_pause = tx_pause ? 1 : 0;
 
-		if (speed == SPEED_1000) {
+		/* The speed field has no value for 2.5 Gbps: the rate is
+		 * determined by the HSGMII SerDes configuration, and the
+		 * vendor driver programs the 1 Gbps value here.
+		 */
+		if (speed == SPEED_2500 || speed == SPEED_1000) {
 			r_speed = RTL8365MB_PORT_SPEED_1000M;
 		} else if (speed == SPEED_100) {
 			r_speed = RTL8365MB_PORT_SPEED_100M;
@@ -1028,6 +1612,8 @@ static void rtl8365mb_phylink_get_caps(struct dsa_switch *ds, int port,
 {
 	const struct rtl8365mb_extint *extint =
 		rtl8365mb_get_port_extint(ds->priv, port);
+	struct realtek_priv *priv = ds->priv;
+	struct rtl8365mb *mb = priv->chip_data;
 
 	config->mac_capabilities = MAC_SYM_PAUSE | MAC_ASYM_PAUSE |
 				   MAC_10 | MAC_100 | MAC_1000FD;
@@ -1051,13 +1637,41 @@ static void rtl8365mb_phylink_get_caps(struct dsa_switch *ds, int port,
 
 	if (extint->supported_interfaces & RTL8365MB_PHY_INTERFACE_MODE_RGMII)
 		phy_interface_set_rgmii(config->supported_interfaces);
+
+	if (extint->supported_interfaces & RTL8365MB_PHY_INTERFACE_MODE_SGMII &&
+	    mb->sds_supported)
+		__set_bit(PHY_INTERFACE_MODE_SGMII,
+			  config->supported_interfaces);
+
+	if (extint->supported_interfaces & RTL8365MB_PHY_INTERFACE_MODE_HSGMII &&
+	    mb->sds_supported) {
+		__set_bit(PHY_INTERFACE_MODE_2500BASEX,
+			  config->supported_interfaces);
+		config->mac_capabilities |= MAC_2500FD;
+	}
 }
 
-static void rtl8365mb_phylink_mac_config(struct dsa_switch *ds, int port,
+static struct phylink_pcs *
+rtl8365mb_phylink_mac_select_pcs(struct phylink_config *config,
+				 phy_interface_t interface)
+{
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
+	struct rtl8365mb *mb = priv->chip_data;
+
+	if (rtl8365mb_interface_is_serdes(interface))
+		return &mb->pcs;
+
+	return NULL;
+}
+
+static void rtl8365mb_phylink_mac_config(struct phylink_config *config,
 					 unsigned int mode,
 					 const struct phylink_link_state *state)
 {
-	struct realtek_priv *priv = ds->priv;
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
+	u8 port = dp->index;
 	int ret;
 
 	if (mode != MLO_AN_PHY && mode != MLO_AN_FIXED) {
@@ -1071,68 +1685,150 @@ static void rtl8365mb_phylink_mac_config(struct dsa_switch *ds, int port,
 		ret = rtl8365mb_ext_config_rgmii(priv, port, state->interface);
 		if (ret)
 			dev_err(priv->dev,
-				"failed to configure RGMII mode on port %d: %d\n",
-				port, ret);
+				"failed to configure RGMII mode on port %d: %pe\n",
+				port, ERR_PTR(ret));
 		return;
 	}
+
+	/* SGMII and 2500base-x are handled by the SerDes PCS, configured
+	 * through the phylink_pcs ops, so nothing to do here for them.
+	 */
+	if (rtl8365mb_interface_is_serdes(state->interface))
+		return;
 
 	/* TODO: Implement MII and RMII modes, which the RTL8365MB-VC also
 	 * supports
 	 */
 }
 
-static void rtl8365mb_phylink_mac_link_down(struct dsa_switch *ds, int port,
+static void rtl8365mb_phylink_mac_link_down(struct phylink_config *config,
 					    unsigned int mode,
 					    phy_interface_t interface)
 {
-	struct realtek_priv *priv = ds->priv;
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
 	struct rtl8365mb_port *p;
 	struct rtl8365mb *mb;
+	u8 port = dp->index;
 	int ret;
 
 	mb = priv->chip_data;
 	p = &mb->ports[port];
 	cancel_delayed_work_sync(&p->mib_work);
 
-	if (phy_interface_mode_is_rgmii(interface)) {
+	/* phylink has no pcs_link_down callback, so on the SerDes path only the
+	 * MAC external interface force is reset here. Clearing the MAC force is
+	 * enough to bring the link down; the SerDes keeps presenting its last
+	 * forced state until the next pcs_link_up() reprograms it.
+	 */
+	if (phy_interface_mode_is_rgmii(interface) ||
+	    rtl8365mb_interface_is_serdes(interface)) {
 		ret = rtl8365mb_ext_config_forcemode(priv, port, false, 0, 0,
 						     false, false);
 		if (ret)
 			dev_err(priv->dev,
-				"failed to reset forced mode on port %d: %d\n",
-				port, ret);
+				"failed to reset forced mode on port %d: %pe\n",
+				port, ERR_PTR(ret));
 
 		return;
 	}
 }
 
-static void rtl8365mb_phylink_mac_link_up(struct dsa_switch *ds, int port,
+static void rtl8365mb_phylink_mac_link_up(struct phylink_config *config,
+					  struct phy_device *phydev,
 					  unsigned int mode,
 					  phy_interface_t interface,
-					  struct phy_device *phydev, int speed,
-					  int duplex, bool tx_pause,
+					  int speed, int duplex, bool tx_pause,
 					  bool rx_pause)
 {
-	struct realtek_priv *priv = ds->priv;
+	struct dsa_port *dp = dsa_phylink_to_port(config);
+	struct realtek_priv *priv = dp->ds->priv;
 	struct rtl8365mb_port *p;
 	struct rtl8365mb *mb;
+	u8 port = dp->index;
 	int ret;
 
 	mb = priv->chip_data;
 	p = &mb->ports[port];
 	schedule_delayed_work(&p->mib_work, 0);
 
-	if (phy_interface_mode_is_rgmii(interface)) {
+	/* The SerDes forced link state is programmed by the PCS in
+	 * rtl8365mb_pcs_link_up(); here only the MAC external interface force
+	 * is configured, for both RGMII and SerDes.
+	 */
+	if (phy_interface_mode_is_rgmii(interface) ||
+	    rtl8365mb_interface_is_serdes(interface)) {
 		ret = rtl8365mb_ext_config_forcemode(priv, port, true, speed,
 						     duplex, tx_pause,
 						     rx_pause);
-		if (ret)
+		if (ret) {
 			dev_err(priv->dev,
-				"failed to force mode on port %d: %d\n", port,
-				ret);
+				"failed to force mode on port %d: %pe\n", port,
+				ERR_PTR(ret));
+			return;
+		}
+
+		/* The SerDes has its own pause enables; program them from
+		 * the resolved pause modes, as the vendor driver does when
+		 * forcing the link on a SerDes external interface. These
+		 * bits, not the MAC force pause bits, gate pause on the
+		 * SerDes external interface: flow control testing shows
+		 * that pause frames are only emitted with the SerDes TXFC
+		 * bit set, while the MAC force pause bits alone have no
+		 * effect on this port. This is done here rather than in
+		 * rtl8365mb_pcs_link_up() because pcs_link_up() carries no
+		 * pause information.
+		 */
+		if (rtl8365mb_interface_is_serdes(interface)) {
+			u32 val = 0;
+
+			if (tx_pause)
+				val |= RTL8365MB_SDS_MISC_SGMII_TXFC_MASK;
+			if (rx_pause)
+				val |= RTL8365MB_SDS_MISC_SGMII_RXFC_MASK;
+
+			ret = regmap_update_bits(priv->map,
+						 RTL8365MB_SDS_MISC_REG,
+						 RTL8365MB_SDS_MISC_SGMII_TXFC_MASK |
+							 RTL8365MB_SDS_MISC_SGMII_RXFC_MASK,
+						 val);
+			if (ret)
+				dev_err(priv->dev,
+					"failed to force SerDes pause modes on port %d: %pe\n",
+					port, ERR_PTR(ret));
+		}
 
 		return;
 	}
+}
+
+static int rtl8365mb_port_change_mtu(struct dsa_switch *ds, int port,
+				     int new_mtu)
+{
+	struct realtek_priv *priv = ds->priv;
+	int frame_size;
+
+	/* When a new MTU is set, DSA always sets the CPU port's MTU to the
+	 * largest MTU of the user ports. Because the switch only has a global
+	 * RX length register, only allowing CPU port here is enough.
+	 */
+	if (!dsa_is_cpu_port(ds, port))
+		return 0;
+
+	frame_size = new_mtu + VLAN_ETH_HLEN + ETH_FCS_LEN;
+
+	dev_dbg(priv->dev, "changing mtu to %d (frame size: %d)\n",
+		new_mtu, frame_size);
+
+	return regmap_update_bits(priv->map, RTL8365MB_CFG0_MAX_LEN_REG,
+				  RTL8365MB_CFG0_MAX_LEN_MASK,
+				  FIELD_PREP(RTL8365MB_CFG0_MAX_LEN_MASK,
+					     frame_size));
+}
+
+static int rtl8365mb_port_max_mtu(struct dsa_switch *ds, int port)
+{
+	return RTL8365MB_CFG0_MAX_LEN_MAX - VLAN_ETH_HLEN - ETH_FCS_LEN;
 }
 
 static void rtl8365mb_port_stp_state_set(struct dsa_switch *ds, int port,
@@ -1166,6 +1862,286 @@ static void rtl8365mb_port_stp_state_set(struct dsa_switch *ds, int port,
 			   val << RTL8365MB_MSTI_CTRL_PORT_STATE_OFFSET(port));
 }
 
+static int rtl8365mb_port_set_transparent(struct realtek_priv *priv,
+					  int igr_port, int egr_port,
+					  bool enable)
+{
+	dev_dbg(priv->dev, "%s transparent VLAN from %d to %d\n",
+		enable ? "Enable" : "Disable", igr_port, egr_port);
+
+	/* "Transparent" between the two ports means that packets forwarded by
+	 * igr_port and egressed on egr_port will not be filtered by the usual
+	 * VLAN membership settings.
+	 */
+	return regmap_update_bits(priv->map,
+			RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG(egr_port),
+			BIT(igr_port), enable ? BIT(igr_port) : 0);
+}
+
+static int rtl8365mb_port_set_ingress_filtering(struct realtek_priv *priv,
+						int port, bool enable)
+{
+	/* Ingress filtering enabled: Discard VLAN-tagged frames if the port is
+	 * not a member of the VLAN with which the packet is associated.
+	 * Untagged packets will also be discarded unless the port has a PVID
+	 * programmed. Priority-tagged frames are treated as untagged frames.
+	 *
+	 * Ingress filtering disabled: Accept all tagged and untagged frames.
+	 */
+	return regmap_update_bits(priv->map, RTL8365MB_VLAN_INGRESS_REG,
+			RTL8365MB_VLAN_INGRESS_FILTER_PORT_EN_MASK(port),
+			enable ?
+			RTL8365MB_VLAN_INGRESS_FILTER_PORT_EN_MASK(port) :
+			0);
+}
+
+static int
+rtl8365mb_port_set_vlan_egress_mode(struct realtek_priv *priv, int port,
+				    enum rtl8365mb_vlan_egress_mode mode)
+{
+	u32 val;
+
+	val = FIELD_PREP(RTL8365MB_PORT_MISC_CFG_VLAN_EGRESS_MODE_MASK, mode);
+	return regmap_update_bits(priv->map,
+			RTL8365MB_PORT_MISC_CFG_REG(port),
+			RTL8365MB_PORT_MISC_CFG_VLAN_EGRESS_MODE_MASK, val);
+}
+
+static int rtl8365mb_port_vlan_filtering(struct dsa_switch *ds, int port,
+					 bool vlan_filtering,
+					 struct netlink_ext_ack *extack)
+{
+	enum rtl8365mb_frame_ingress accepted_frame, prev_accepted_frame;
+	enum rtl8365mb_vlan_egress_mode mode;
+	struct realtek_priv *priv = ds->priv;
+	u32 configured_ports = 0;
+	struct dsa_port *dp;
+	u16 pvid_vid;
+	int ret;
+
+	dev_dbg(priv->dev, "port %d: %s VLAN filtering\n", port,
+		vlan_filtering ? "enable" : "disable");
+
+	ret = rtl8365mb_vlan_port_get_framefilter(priv, port,
+						  &prev_accepted_frame);
+	if (ret) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "Failed to get current framefilter");
+		return ret;
+	}
+
+	/* While filtering, only accepts untagged frames if PVID is enabled */
+	if (vlan_filtering) {
+		ret = rtl8365mb_vlan_port_get_pvid(priv, port, &pvid_vid);
+		if (ret)
+			return ret;
+
+		if (pvid_vid)
+			accepted_frame = RTL8365MB_FRAME_TYPE_ANY_FRAME;
+		else
+			accepted_frame = RTL8365MB_FRAME_TYPE_TAGGED_ONLY;
+	} else {
+		accepted_frame = RTL8365MB_FRAME_TYPE_ANY_FRAME;
+	}
+
+	/* When vlan filter is enable/disabled in a bridge, this function is
+	 * called for all member ports. We need to enable/disable ingress
+	 * VLAN membership check.
+	 */
+	ret = rtl8365mb_port_set_ingress_filtering(priv, port, vlan_filtering);
+	if (ret)
+		return ret;
+
+	/* However, we also enable/disable egress filtering because the switch
+	 * still consider the egress interface VLAN membership to forward the
+	 * traffic. We enable/disable that check disabling/enabling transparent
+	 * VLAN between the ingress port and all other available ports.
+	 */
+	dsa_switch_for_each_available_port(dp, ds) {
+		/* port isolation will still keep traffic inside the bridge */
+		ret = rtl8365mb_port_set_transparent(priv, port, dp->index,
+						     !vlan_filtering);
+		if (ret)
+			goto undo_transparent;
+
+		configured_ports |= BIT(dp->index);
+	}
+
+	if (accepted_frame != prev_accepted_frame) {
+		ret = rtl8365mb_vlan_port_set_framefilter(priv, port,
+							  accepted_frame);
+		if (ret) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Failed to set port framefilter");
+			goto undo_transparent;
+		}
+	}
+
+	/* When VLAN filtering is disabled, preserve frames exactly as received.
+	 * Otherwise, the VLAN egress pipeline may still alter tag state
+	 * according to VLAN membership and untag configuration.
+	 */
+	if (vlan_filtering)
+		mode = RTL8365MB_VLAN_EGRESS_MODE_ORIGINAL;
+	else
+		mode = RTL8365MB_VLAN_EGRESS_MODE_REAL_KEEP;
+
+	ret = rtl8365mb_port_set_vlan_egress_mode(priv, port, mode);
+	if (ret)
+		goto undo_set_framefilter;
+
+	return ret;
+
+undo_set_framefilter:
+	if (prev_accepted_frame != accepted_frame)
+		rtl8365mb_vlan_port_set_framefilter(priv, port,
+						    prev_accepted_frame);
+undo_transparent:
+	/* The DSA core guarantees this callback is only invoked on an actual
+	 * state transition, ensuring the previous hardware state was the
+	 * opposite (!vlan_filtering). It is also called during setup but, in
+	 * that case, any failure here aborts the entire switch initialization.
+	 *
+	 * VLAN_INGRESS and VLAN_EGRESS_TRANSPARENT states are directly derived
+	 * from vlan_filtering. That way, we can simply undo it without
+	 * checking the current HW state as we do with VLAN_EGRESS_MODE.
+	 */
+	dsa_switch_for_each_port(dp, ds) {
+		if (configured_ports & BIT(dp->index))
+			rtl8365mb_port_set_transparent(priv, port, dp->index,
+						       vlan_filtering);
+	}
+
+	rtl8365mb_port_set_ingress_filtering(priv, port, !vlan_filtering);
+
+	return ret;
+}
+
+static int rtl8365mb_port_vlan_add(struct dsa_switch *ds, int port,
+				   const struct switchdev_obj_port_vlan *vlan,
+				   struct netlink_ext_ack *extack)
+{
+	bool untagged = !!(vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED);
+	bool pvid = !!(vlan->flags & BRIDGE_VLAN_INFO_PVID);
+	u16 pvid_vid;
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	dev_dbg(priv->dev, "add VLAN %d on port %d, %s, %s\n",
+		vlan->vid, port, untagged ? "untagged" : "tagged",
+		pvid ? "PVID" : "no PVID");
+
+	/* VID == 0 is reserved in this driver */
+	if (vlan->vid == 0) {
+		NL_SET_ERR_MSG_MOD(extack,
+				   "VLAN 0 is reserved by this driver");
+		return -EOPNOTSUPP;
+	}
+
+	mutex_lock(&priv->vlan_lock);
+
+	ret = rtl8365mb_vlan_port_get_pvid(priv, port, &pvid_vid);
+	if (ret)
+		goto out_unlock;
+
+	/* Set PVID if needed */
+	if (pvid) {
+		ret = rtl8365mb_vlan_pvid_port_set(ds, port, vlan->vid,
+						   extack);
+		if (ret)
+			goto out_unlock;
+	} else {
+		/* or try to unset it if not */
+		ret = rtl8365mb_vlan_pvid_port_clear(ds, port, vlan->vid);
+		if (ret)
+			goto out_unlock;
+	}
+
+	/* add port to vlan4k. It knows nothing about PVID */
+	ret = rtl8365mb_vlan_4k_port_add(ds, port, vlan, extack);
+	if (ret)
+		goto undo_set_pvid;
+
+	ret = 0;
+	goto out_unlock;
+
+undo_set_pvid:
+	/* undo the pvid definition */
+	if (pvid != (pvid_vid == vlan->vid)) {
+		if (pvid_vid)
+			(void)rtl8365mb_vlan_pvid_port_set(ds, port, pvid_vid,
+							   NULL);
+		else
+			(void)rtl8365mb_vlan_pvid_port_clear(ds, port,
+							     vlan->vid);
+	}
+out_unlock:
+	mutex_unlock(&priv->vlan_lock);
+	return ret;
+}
+
+static int rtl8365mb_port_vlan_del(struct dsa_switch *ds, int port,
+				   const struct switchdev_obj_port_vlan *vlan)
+{
+	bool untagged = !!(vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED);
+	bool pvid = !!(vlan->flags & BRIDGE_VLAN_INFO_PVID);
+	struct realtek_priv *priv = ds->priv;
+	int ret;
+
+	dev_dbg(priv->dev, "del VLAN %d on port %d, %s, %s\n",
+		vlan->vid, port, untagged ? "untagged" : "tagged",
+		pvid ? "PVID" : "no PVID");
+
+	/* VID == 0 is reserved in this driver */
+	if (vlan->vid == 0)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&priv->vlan_lock);
+	ret = rtl8365mb_vlan_pvid_port_clear(ds, port, vlan->vid);
+	if (ret)
+		goto out_unlock;
+
+	ret = rtl8365mb_vlan_4k_port_del(ds, port, vlan);
+	/* There is little incentive to try to undo the removal of PVID (if it
+	 * was really in use) as an error here might indicate the ASIC stopped
+	 * to answer.
+	 */
+
+out_unlock:
+	mutex_unlock(&priv->vlan_lock);
+	return ret;
+}
+
+/* VLAN support is always enabled in the switch.
+ *
+ * Standalone forwarding relies on transparent VLAN mode combined with per-port
+ * isolation masks restricting egress to CPU ports only.
+ *
+ */
+static int rtl8365mb_vlan_setup(struct dsa_switch *ds)
+{
+	struct realtek_priv *priv = ds->priv;
+	struct dsa_port *dp;
+	int ret;
+
+	dsa_switch_for_each_available_port(dp, ds) {
+		/* Disable vlan-filtering for all ports */
+		ret = rtl8365mb_port_vlan_filtering(ds, dp->index, false, NULL);
+		if (ret) {
+			dev_err(priv->dev,
+				"Failed to disable vlan filtering on port %d\n",
+				dp->index);
+			return ret;
+		}
+	}
+
+	/* VLAN is always enabled. */
+	ret = regmap_update_bits(priv->map, RTL8365MB_VLAN_CTRL_REG,
+				 RTL8365MB_VLAN_CTRL_EN_MASK,
+				 FIELD_PREP(RTL8365MB_VLAN_CTRL_EN_MASK, 1));
+	return ret;
+}
+
 static int rtl8365mb_port_set_learning(struct realtek_priv *priv, int port,
 				       bool enable)
 {
@@ -1178,10 +2154,87 @@ static int rtl8365mb_port_set_learning(struct realtek_priv *priv, int port,
 			    enable ? RTL8365MB_LEARN_LIMIT_MAX : 0);
 }
 
+static int rtl8365mb_port_set_ucast_flood(struct realtek_priv *priv, int port,
+					  bool enable)
+{
+	/* Frames with unknown unicast DA will be flooded to a programmable
+	 * port mask that by default includes all ports. Add or remove
+	 * the specified port from this port mask accordingly.
+	 */
+	return regmap_update_bits(priv->map,
+				  RTL8365MB_UNKNOWN_UNICAST_FLOODING_PMASK_REG,
+				  BIT(port), enable ? BIT(port) : 0);
+}
+
+static int rtl8365mb_port_set_mcast_flood(struct realtek_priv *priv, int port,
+					  bool enable)
+{
+	return regmap_update_bits(priv->map,
+			RTL8365MB_UNKNOWN_MULTICAST_FLOODING_PMASK_REG,
+			BIT(port), enable ? BIT(port) : 0);
+}
+
+static int rtl8365mb_port_set_bcast_flood(struct realtek_priv *priv, int port,
+					  bool enable)
+{
+	return regmap_update_bits(priv->map,
+			RTL8365MB_UNKNOWN_BROADCAST_FLOODING_PMASK_REG,
+			BIT(port), enable ? BIT(port) : 0);
+}
+
+static int rtl8365mb_port_pre_bridge_flags(struct dsa_switch *ds, int port,
+					   struct switchdev_brport_flags flags,
+					   struct netlink_ext_ack *extack)
+{
+	struct realtek_priv *priv = ds->priv;
+
+	dev_dbg(priv->dev, "pre_bridge_flags port:%d flags:%lx supported:%lx\n",
+		port, flags.mask, RTL8365MB_SUPPORTED_BRIDGE_FLAGS);
+
+	if (flags.mask & ~RTL8365MB_SUPPORTED_BRIDGE_FLAGS)
+		return -EINVAL;
+
+	return 0;
+}
+
+static int rtl8365mb_port_set_efid(struct realtek_priv *priv, int port,
+				   u32 efid)
+{
+	return regmap_update_bits(priv->map, RTL8365MB_PORT_EFID_REG(port),
+				  RTL8365MB_PORT_EFID_MASK(port),
+				  efid << RTL8365MB_PORT_EFID_OFFSET(port));
+}
+
+/* Port isolation manipulation functions.
+ *
+ * The port isolation register controls the forwarding mask of a given
+ * port. The switch will not forward packets ingressed on a given port
+ * to ports which are not enabled in its forwarding mask.
+ *
+ * The port forwarding mask has the highest priority in forwarding
+ * decisions. The only exception to this rule is when the switch
+ * receives a packet on its CPU port with ALLOW=0. In that case the TX
+ * field of the CPU tag will override the forwarding port mask.
+ */
 static int rtl8365mb_port_set_isolation(struct realtek_priv *priv, int port,
 					u32 mask)
 {
-	return regmap_write(priv->map, RTL8365MB_PORT_ISOLATION_REG(port), mask);
+	return regmap_write(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+			    mask);
+}
+
+static int rtl8365mb_port_add_isolation(struct realtek_priv *priv, int port,
+					u32 mask)
+{
+	return regmap_update_bits(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+				  mask, mask);
+}
+
+static int rtl8365mb_port_remove_isolation(struct realtek_priv *priv, int port,
+					   u32 mask)
+{
+	return regmap_update_bits(priv->map, RTL8365MB_PORT_ISOLATION_REG(port),
+				  mask, 0);
 }
 
 static int rtl8365mb_mib_counter_read(struct realtek_priv *priv, int port,
@@ -1255,8 +2308,8 @@ static void rtl8365mb_get_ethtool_stats(struct dsa_switch *ds, int port, u64 *da
 						 mib->length, &data[i]);
 		if (ret) {
 			dev_err(priv->dev,
-				"failed to read port %d counters: %d\n", port,
-				ret);
+				"failed to read port %d counters: %pe\n", port,
+				ERR_PTR(ret));
 			break;
 		}
 	}
@@ -1272,8 +2325,7 @@ static void rtl8365mb_get_strings(struct dsa_switch *ds, int port, u32 stringset
 
 	for (i = 0; i < RTL8365MB_MIB_END; i++) {
 		struct rtl8365mb_mib_counter *mib = &rtl8365mb_mib_counters[i];
-
-		strncpy(data + i * ETH_GSTRING_LEN, mib->name, ETH_GSTRING_LEN);
+		ethtool_puts(&data, mib->name);
 	}
 }
 
@@ -1507,21 +2559,22 @@ static void rtl8365mb_get_stats64(struct dsa_switch *ds, int port,
 	spin_unlock(&p->stats_lock);
 }
 
-static void rtl8365mb_stats_setup(struct realtek_priv *priv)
+static int rtl8365mb_stats_setup(struct realtek_priv *priv)
 {
 	struct rtl8365mb *mb = priv->chip_data;
-	int i;
+	struct dsa_switch *ds = &priv->ds;
+	struct dsa_port *dp;
+	int ret;
 
 	/* Per-chip global mutex to protect MIB counter access, since doing
 	 * so requires accessing a series of registers in a particular order.
 	 */
-	mutex_init(&mb->mib_lock);
+	ret = devm_mutex_init(priv->dev, &mb->mib_lock);
+	if (ret)
+		return ret;
 
-	for (i = 0; i < priv->num_ports; i++) {
-		struct rtl8365mb_port *p = &mb->ports[i];
-
-		if (dsa_is_unused_port(priv->ds, i))
-			continue;
+	dsa_switch_for_each_available_port(dp, ds) {
+		struct rtl8365mb_port *p = &mb->ports[dp->index];
 
 		/* Per-port spinlock to protect the stats64 data */
 		spin_lock_init(&p->stats_lock);
@@ -1531,18 +2584,18 @@ static void rtl8365mb_stats_setup(struct realtek_priv *priv)
 		 */
 		INIT_DELAYED_WORK(&p->mib_work, rtl8365mb_stats_poll);
 	}
+
+	return 0;
 }
 
 static void rtl8365mb_stats_teardown(struct realtek_priv *priv)
 {
 	struct rtl8365mb *mb = priv->chip_data;
-	int i;
+	struct dsa_switch *ds = &priv->ds;
+	struct dsa_port *dp;
 
-	for (i = 0; i < priv->num_ports; i++) {
-		struct rtl8365mb_port *p = &mb->ports[i];
-
-		if (dsa_is_unused_port(priv->ds, i))
-			continue;
+	dsa_switch_for_each_available_port(dp, ds) {
+		struct rtl8365mb_port *p = &mb->ports[dp->index];
 
 		cancel_delayed_work_sync(&p->mib_work);
 	}
@@ -1601,13 +2654,17 @@ static irqreturn_t rtl8365mb_irq(int irq, void *data)
 	for_each_set_bit(line, &line_changes, priv->num_ports) {
 		int child_irq = irq_find_mapping(priv->irqdomain, line);
 
+		if (!child_irq)
+			continue;
+
 		handle_nested_irq(child_irq);
 	}
 
 	return IRQ_HANDLED;
 
 out_error:
-	dev_err(priv->dev, "failed to read interrupt status: %d\n", ret);
+	dev_err(priv->dev, "failed to read interrupt status: %pe\n",
+		ERR_PTR(ret));
 
 out_none:
 	return IRQ_NONE;
@@ -1621,10 +2678,14 @@ static struct irq_chip rtl8365mb_irq_chip = {
 static int rtl8365mb_irq_map(struct irq_domain *domain, unsigned int irq,
 			     irq_hw_number_t hwirq)
 {
-	irq_set_chip_data(irq, domain->host_data);
+	struct realtek_priv *priv = domain->host_data;
+	struct rtl8365mb *mb = priv->chip_data;
+
+	irq_set_chip_data(irq, priv);
 	irq_set_chip_and_handler(irq, &rtl8365mb_irq_chip, handle_simple_irq);
 	irq_set_nested_thread(irq, 1);
 	irq_set_noprobe(irq);
+	irq_set_parent(irq, mb->irq);
 
 	return 0;
 }
@@ -1663,13 +2724,14 @@ static int rtl8365mb_irq_disable(struct realtek_priv *priv)
 static int rtl8365mb_irq_setup(struct realtek_priv *priv)
 {
 	struct rtl8365mb *mb = priv->chip_data;
+	struct dsa_switch *ds = &priv->ds;
 	struct device_node *intc;
+	struct dsa_port *dp;
 	u32 irq_trig;
 	int virq;
 	int irq;
 	u32 val;
 	int ret;
-	int i;
 
 	intc = of_get_child_by_name(priv->dev->of_node, "interrupt-controller");
 	if (!intc) {
@@ -1680,23 +2742,29 @@ static int rtl8365mb_irq_setup(struct realtek_priv *priv)
 	/* rtl8365mb IRQs cascade off this one */
 	irq = of_irq_get(intc, 0);
 	if (irq <= 0) {
-		if (irq != -EPROBE_DEFER)
-			dev_err(priv->dev, "failed to get parent irq: %d\n",
-				irq);
-		ret = irq ? irq : -EINVAL;
+		if (!irq) {
+			dev_err(priv->dev, "failed to map IRQ\n");
+			ret = -EINVAL;
+		} else {
+			ret = dev_err_probe(priv->dev, irq,
+					    "failed to get parent irq\n");
+		}
 		goto out_put_node;
 	}
 
-	priv->irqdomain = irq_domain_add_linear(intc, priv->num_ports,
-						&rtl8365mb_irqdomain_ops, priv);
+	/* Store the irq so that we know to map and free it during teardown */
+	mb->irq = irq;
+
+	priv->irqdomain = irq_domain_create_linear(of_fwnode_handle(intc), priv->num_ports,
+						   &rtl8365mb_irqdomain_ops, priv);
 	if (!priv->irqdomain) {
 		dev_err(priv->dev, "failed to add irq domain\n");
 		ret = -ENOMEM;
 		goto out_put_node;
 	}
 
-	for (i = 0; i < priv->num_ports; i++) {
-		virq = irq_create_mapping(priv->irqdomain, i);
+	dsa_switch_for_each_available_port(dp, ds) {
+		virq = irq_create_mapping(priv->irqdomain, dp->index);
 		if (!virq) {
 			dev_err(priv->dev,
 				"failed to create irq domain mapping\n");
@@ -1708,7 +2776,7 @@ static int rtl8365mb_irq_setup(struct realtek_priv *priv)
 	}
 
 	/* Configure chip interrupt signal polarity */
-	irq_trig = irqd_get_trigger_type(irq_get_irq_data(irq));
+	irq_trig = irq_get_trigger_type(irq);
 	switch (irq_trig) {
 	case IRQF_TRIGGER_RISING:
 	case IRQF_TRIGGER_HIGH:
@@ -1745,12 +2813,10 @@ static int rtl8365mb_irq_setup(struct realtek_priv *priv)
 	ret = request_threaded_irq(irq, NULL, rtl8365mb_irq, IRQF_ONESHOT,
 				   "rtl8365mb", priv);
 	if (ret) {
-		dev_err(priv->dev, "failed to request irq: %d\n", ret);
+		dev_err(priv->dev, "failed to request irq: %pe\n",
+			ERR_PTR(ret));
 		goto out_remove_irqdomain;
 	}
-
-	/* Store the irq so that we know to free it during teardown */
-	mb->irq = irq;
 
 	ret = rtl8365mb_irq_enable(priv);
 	if (ret)
@@ -1762,18 +2828,20 @@ static int rtl8365mb_irq_setup(struct realtek_priv *priv)
 
 out_free_irq:
 	free_irq(mb->irq, priv);
-	mb->irq = 0;
 
 out_remove_irqdomain:
-	for (i = 0; i < priv->num_ports; i++) {
-		virq = irq_find_mapping(priv->irqdomain, i);
-		irq_dispose_mapping(virq);
+	dsa_switch_for_each_port(dp, ds) {
+		virq = irq_find_mapping(priv->irqdomain, dp->index);
+
+		if (virq)
+			irq_dispose_mapping(virq);
 	}
 
 	irq_domain_remove(priv->irqdomain);
 	priv->irqdomain = NULL;
 
 out_put_node:
+	mb->irq = 0;
 	of_node_put(intc);
 
 	return ret;
@@ -1782,8 +2850,9 @@ out_put_node:
 static void rtl8365mb_irq_teardown(struct realtek_priv *priv)
 {
 	struct rtl8365mb *mb = priv->chip_data;
+	struct dsa_switch *ds = &priv->ds;
+	struct dsa_port *dp;
 	int virq;
-	int i;
 
 	if (mb->irq) {
 		free_irq(mb->irq, priv);
@@ -1791,9 +2860,15 @@ static void rtl8365mb_irq_teardown(struct realtek_priv *priv)
 	}
 
 	if (priv->irqdomain) {
-		for (i = 0; i < priv->num_ports; i++) {
-			virq = irq_find_mapping(priv->irqdomain, i);
-			irq_dispose_mapping(virq);
+		/* Unused ports with a linked PHY still have an active IRQ
+		 * mapping that must be disposed of during teardown. Loop
+		 * through all ports.
+		 */
+		dsa_switch_for_each_port(dp, ds) {
+			virq = irq_find_mapping(priv->irqdomain, dp->index);
+
+			if (virq)
+				irq_dispose_mapping(virq);
 		}
 
 		irq_domain_remove(priv->irqdomain);
@@ -1911,25 +2986,53 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 {
 	struct realtek_priv *priv = ds->priv;
 	struct rtl8365mb_cpu *cpu;
-	struct dsa_port *cpu_dp;
+	u32 downports_mask = 0;
+	u32 upports_mask = 0;
 	struct rtl8365mb *mb;
+	struct dsa_port *dp;
 	int ret;
-	int i;
 
 	mb = priv->chip_data;
 	cpu = &mb->cpu;
 
+	mb->pcs.ops = &rtl8365mb_pcs_ops;
+
+	/* The SerDes has no link interrupt wired up, so phylink must poll the
+	 * PCS for link changes when it tracks the link through pcs_get_state()
+	 * (in-band mode with autonegotiation disabled).
+	 */
+	mb->pcs.poll = true;
+
 	ret = rtl8365mb_reset_chip(priv);
 	if (ret) {
-		dev_err(priv->dev, "failed to reset chip: %d\n", ret);
+		dev_err(priv->dev, "failed to reset chip: %pe\n",
+			ERR_PTR(ret));
+		goto out_error;
+	}
+
+	ret = rtl8365mb_sds_probe_option(priv);
+	if (ret) {
+		dev_err(priv->dev, "failed to probe SerDes chip option: %pe\n",
+			ERR_PTR(ret));
 		goto out_error;
 	}
 
 	/* Configure switch to vendor-defined initial state */
 	ret = rtl8365mb_switch_init(priv);
 	if (ret) {
-		dev_err(priv->dev, "failed to initialize switch: %d\n", ret);
+		dev_err(priv->dev, "failed to initialize switch: %pe\n",
+			ERR_PTR(ret));
 		goto out_error;
+	}
+
+	if (mb->sds_supported) {
+		ret = rtl8365mb_sds_raise_rate_limits(priv);
+		if (ret) {
+			dev_err(priv->dev,
+				"failed to raise port rate limits: %pe\n",
+				ERR_PTR(ret));
+			goto out_error;
+		}
 	}
 
 	/* Set up cascading IRQs */
@@ -1939,63 +3042,138 @@ static int rtl8365mb_setup(struct dsa_switch *ds)
 	else if (ret)
 		dev_info(priv->dev, "no interrupt support\n");
 
-	/* Configure CPU tagging */
-	dsa_switch_for_each_cpu_port(cpu_dp, priv->ds) {
-		cpu->mask |= BIT(cpu_dp->index);
-
-		if (cpu->trap_port == RTL8365MB_MAX_NUM_PORTS)
-			cpu->trap_port = cpu_dp->index;
+	dsa_switch_for_each_port(dp, ds) {
+		/* Cascading (DSA links) is not supported yet.
+		 * Historically, the driver has always been broken
+		 * without a dedicated CPU port because CPU tagging
+		 * would be disabled, rendering the switch entirely
+		 * non-functional for DSA operations.
+		 */
+		if (dsa_port_is_dsa(dp)) {
+			dev_err(priv->dev, "Cascading (DSA link) not supported\n");
+			ret = -EOPNOTSUPP;
+			goto out_teardown_irq;
+		}
 	}
-	cpu->enable = cpu->mask > 0;
-	ret = rtl8365mb_cpu_config(priv);
-	if (ret)
-		goto out_teardown_irq;
 
-	/* Configure ports */
-	for (i = 0; i < priv->num_ports; i++) {
-		struct rtl8365mb_port *p = &mb->ports[i];
-
-		if (dsa_is_unused_port(priv->ds, i))
-			continue;
-
-		/* Forward only to the CPU */
-		ret = rtl8365mb_port_set_isolation(priv, i, cpu->mask);
-		if (ret)
-			goto out_teardown_irq;
-
-		/* Disable learning */
-		ret = rtl8365mb_port_set_learning(priv, i, false);
-		if (ret)
-			goto out_teardown_irq;
+	/* Start with all ports blocked, including unused ports */
+	dsa_switch_for_each_port(dp, ds) {
+		struct rtl8365mb_port *p = &mb->ports[dp->index];
 
 		/* Set the initial STP state of all ports to DISABLED, otherwise
 		 * ports will still forward frames to the CPU despite being
 		 * administratively down by default.
 		 */
-		rtl8365mb_port_stp_state_set(priv->ds, i, BR_STATE_DISABLED);
+		rtl8365mb_port_stp_state_set(ds, dp->index, BR_STATE_DISABLED);
+
+		/* Start with all port completely isolated */
+		ret = rtl8365mb_port_set_isolation(priv, dp->index, 0);
+		if (ret)
+			goto out_teardown_irq;
+
+		/* Set the default EFID 0 for standalone mode */
+		ret = rtl8365mb_port_set_efid(priv, dp->index, 0);
+		if (ret)
+			goto out_teardown_irq;
+
+		/* Disable learning */
+		ret = rtl8365mb_port_set_learning(priv, dp->index, false);
+		if (ret)
+			goto out_teardown_irq;
+
+		/* Enable all types of flooding */
+		ret = rtl83xx_setup_port_flood_control(priv, dp->index);
+		if (ret)
+			goto out_teardown_irq;
 
 		/* Set up per-port private data */
 		p->priv = priv;
-		p->index = i;
+		p->index = dp->index;
+
+		/* Collect CPU ports. If we support cascade switches, it should
+		 * also include the upstream DSA ports.
+		 */
+		if (!dsa_port_is_cpu(dp))
+			continue;
+
+		upports_mask |= BIT(dp->index);
 	}
 
-	/* Set maximum packet length to 1536 bytes */
-	ret = regmap_update_bits(priv->map, RTL8365MB_CFG0_MAX_LEN_REG,
-				 RTL8365MB_CFG0_MAX_LEN_MASK,
-				 FIELD_PREP(RTL8365MB_CFG0_MAX_LEN_MASK, 1536));
+	/* Configure user ports */
+	dsa_switch_for_each_port(dp, ds) {
+		if (!dsa_port_is_user(dp))
+			continue;
+
+		/* Forward only to the CPU */
+		ret = rtl8365mb_port_set_isolation(priv, dp->index,
+						   upports_mask);
+		if (ret)
+			goto out_teardown_irq;
+
+		/* If we support cascade switches, it should also include the
+		 * downstream DSA ports.
+		 */
+		downports_mask |= BIT(dp->index);
+	}
+
+	/* Configure CPU tagging */
+	/* If we support cascade switches, it should also include the upstream
+	 * DSA ports.
+	 */
+	dsa_switch_for_each_cpu_port(dp, ds) {
+		/* Use the first CPU port as trap_port */
+		if (cpu->trap_port == RTL8365MB_MAX_NUM_PORTS)
+			cpu->trap_port = dp->index;
+
+		/* Forward to all user ports */
+		ret = rtl8365mb_port_set_isolation(priv, dp->index,
+						   downports_mask);
+		if (ret)
+			goto out_teardown_irq;
+	}
+
+	cpu->mask = upports_mask;
+	cpu->enable = cpu->mask > 0;
+
+	if (!cpu->enable) {
+		dev_err(priv->dev, "no CPU port defined\n");
+		ret = -EINVAL;
+		goto out_teardown_irq;
+	}
+
+	ret = rtl8365mb_cpu_config(priv);
 	if (ret)
 		goto out_teardown_irq;
 
-	if (priv->setup_interface) {
-		ret = priv->setup_interface(ds);
-		if (ret) {
-			dev_err(priv->dev, "could not set up MDIO bus\n");
-			goto out_teardown_irq;
-		}
+	ret = rtl8365mb_port_change_mtu(ds, cpu->trap_port, ETH_DATA_LEN);
+	if (ret)
+		goto out_teardown_irq;
+
+	ds->assisted_learning_on_cpu_port = true;
+	ds->fdb_isolation = true;
+	/* The EFID is 3 bits, but EFID 0 is reserved for standalone ports */
+	ds->max_num_bridges = FIELD_MAX(RTL8365MB_EFID_MASK);
+
+	ds->configure_vlan_while_not_filtering = true;
+
+	/* Set up VLAN */
+	ret = rtl8365mb_vlan_setup(ds);
+	if (ret)
+		goto out_teardown_irq;
+
+	ret = rtl83xx_setup_user_mdio(ds);
+	if (ret) {
+		dev_err(priv->dev, "could not set up MDIO bus\n");
+		goto out_teardown_irq;
 	}
 
 	/* Start statistics counter polling */
-	rtl8365mb_stats_setup(priv);
+	ret = rtl8365mb_stats_setup(priv);
+	if (ret) {
+		dev_err(priv->dev, "failed to setup stats: %pe\n",
+			ERR_PTR(ret));
+		goto out_teardown_irq;
+	}
 
 	return 0;
 
@@ -2051,8 +3229,8 @@ static int rtl8365mb_detect(struct realtek_priv *priv)
 
 	ret = rtl8365mb_get_chip_id_and_ver(priv->map, &chip_id, &chip_ver);
 	if (ret) {
-		dev_err(priv->dev, "failed to read chip id and version: %d\n",
-			ret);
+		dev_err(priv->dev, "failed to read chip id and version: %pe\n",
+			ERR_PTR(ret));
 		return ret;
 	}
 
@@ -2085,37 +3263,33 @@ static int rtl8365mb_detect(struct realtek_priv *priv)
 	return 0;
 }
 
-static const struct dsa_switch_ops rtl8365mb_switch_ops_smi = {
-	.get_tag_protocol = rtl8365mb_get_tag_protocol,
-	.change_tag_protocol = rtl8365mb_change_tag_protocol,
-	.setup = rtl8365mb_setup,
-	.teardown = rtl8365mb_teardown,
-	.phylink_get_caps = rtl8365mb_phylink_get_caps,
-	.phylink_mac_config = rtl8365mb_phylink_mac_config,
-	.phylink_mac_link_down = rtl8365mb_phylink_mac_link_down,
-	.phylink_mac_link_up = rtl8365mb_phylink_mac_link_up,
-	.port_stp_state_set = rtl8365mb_port_stp_state_set,
-	.get_strings = rtl8365mb_get_strings,
-	.get_ethtool_stats = rtl8365mb_get_ethtool_stats,
-	.get_sset_count = rtl8365mb_get_sset_count,
-	.get_eth_phy_stats = rtl8365mb_get_phy_stats,
-	.get_eth_mac_stats = rtl8365mb_get_mac_stats,
-	.get_eth_ctrl_stats = rtl8365mb_get_ctrl_stats,
-	.get_stats64 = rtl8365mb_get_stats64,
+static const struct phylink_mac_ops rtl8365mb_phylink_mac_ops = {
+	.mac_select_pcs = rtl8365mb_phylink_mac_select_pcs,
+	.mac_config = rtl8365mb_phylink_mac_config,
+	.mac_link_down = rtl8365mb_phylink_mac_link_down,
+	.mac_link_up = rtl8365mb_phylink_mac_link_up,
 };
 
-static const struct dsa_switch_ops rtl8365mb_switch_ops_mdio = {
+static const struct dsa_switch_ops rtl8365mb_switch_ops = {
 	.get_tag_protocol = rtl8365mb_get_tag_protocol,
 	.change_tag_protocol = rtl8365mb_change_tag_protocol,
 	.setup = rtl8365mb_setup,
 	.teardown = rtl8365mb_teardown,
 	.phylink_get_caps = rtl8365mb_phylink_get_caps,
-	.phylink_mac_config = rtl8365mb_phylink_mac_config,
-	.phylink_mac_link_down = rtl8365mb_phylink_mac_link_down,
-	.phylink_mac_link_up = rtl8365mb_phylink_mac_link_up,
-	.phy_read = rtl8365mb_dsa_phy_read,
-	.phy_write = rtl8365mb_dsa_phy_write,
+	.port_bridge_join = rtl83xx_port_bridge_join,
+	.port_bridge_leave = rtl83xx_port_bridge_leave,
+	.port_pre_bridge_flags = rtl8365mb_port_pre_bridge_flags,
+	.port_bridge_flags = rtl83xx_port_bridge_flags,
 	.port_stp_state_set = rtl8365mb_port_stp_state_set,
+	.port_fast_age = rtl83xx_port_fast_age,
+	.port_fdb_add = rtl83xx_port_fdb_add,
+	.port_fdb_del = rtl83xx_port_fdb_del,
+	.port_fdb_dump = rtl83xx_port_fdb_dump,
+	.port_mdb_add = rtl83xx_port_mdb_add,
+	.port_mdb_del = rtl83xx_port_mdb_del,
+	.port_vlan_add = rtl8365mb_port_vlan_add,
+	.port_vlan_del = rtl8365mb_port_vlan_del,
+	.port_vlan_filtering = rtl8365mb_port_vlan_filtering,
 	.get_strings = rtl8365mb_get_strings,
 	.get_ethtool_stats = rtl8365mb_get_ethtool_stats,
 	.get_sset_count = rtl8365mb_get_sset_count,
@@ -2123,25 +3297,91 @@ static const struct dsa_switch_ops rtl8365mb_switch_ops_mdio = {
 	.get_eth_mac_stats = rtl8365mb_get_mac_stats,
 	.get_eth_ctrl_stats = rtl8365mb_get_ctrl_stats,
 	.get_stats64 = rtl8365mb_get_stats64,
+	.port_change_mtu = rtl8365mb_port_change_mtu,
+	.port_max_mtu = rtl8365mb_port_max_mtu,
 };
 
 static const struct realtek_ops rtl8365mb_ops = {
 	.detect = rtl8365mb_detect,
+	.port_add_isolation = rtl8365mb_port_add_isolation,
+	.port_remove_isolation = rtl8365mb_port_remove_isolation,
+	.port_set_efid = rtl8365mb_port_set_efid,
+	.port_set_learning = rtl8365mb_port_set_learning,
+	.port_set_ucast_flood = rtl8365mb_port_set_ucast_flood,
+	.port_set_mcast_flood = rtl8365mb_port_set_mcast_flood,
+	.port_set_bcast_flood = rtl8365mb_port_set_bcast_flood,
+	.l2_add_uc = rtl8365mb_l2_add_uc,
+	.l2_del_uc = rtl8365mb_l2_del_uc,
+	.l2_get_next_uc = rtl8365mb_l2_get_next_uc,
+	.l2_add_mc = rtl8365mb_l2_add_mc,
+	.l2_del_mc = rtl8365mb_l2_del_mc,
+	.l2_flush = rtl8365mb_l2_flush,
 	.phy_read = rtl8365mb_phy_read,
 	.phy_write = rtl8365mb_phy_write,
 };
 
 const struct realtek_variant rtl8365mb_variant = {
-	.ds_ops_smi = &rtl8365mb_switch_ops_smi,
-	.ds_ops_mdio = &rtl8365mb_switch_ops_mdio,
+	.ds_ops = &rtl8365mb_switch_ops,
 	.ops = &rtl8365mb_ops,
+	.phylink_mac_ops = &rtl8365mb_phylink_mac_ops,
 	.clk_delay = 10,
 	.cmd_read = 0xb9,
 	.cmd_write = 0xb8,
 	.chip_data_sz = sizeof(struct rtl8365mb),
 };
-EXPORT_SYMBOL_GPL(rtl8365mb_variant);
+
+static const struct of_device_id rtl8365mb_of_match[] = {
+	{ .compatible = "realtek,rtl8365mb", .data = &rtl8365mb_variant, },
+	{ /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(of, rtl8365mb_of_match);
+
+static struct platform_driver rtl8365mb_smi_driver = {
+	.driver = {
+		.name = "rtl8365mb-smi",
+		.of_match_table = rtl8365mb_of_match,
+	},
+	.probe  = realtek_smi_probe,
+	.remove = realtek_smi_remove,
+	.shutdown = realtek_smi_shutdown,
+};
+
+static struct mdio_driver rtl8365mb_mdio_driver = {
+	.mdiodrv.driver = {
+		.name = "rtl8365mb-mdio",
+		.of_match_table = rtl8365mb_of_match,
+	},
+	.probe  = realtek_mdio_probe,
+	.remove = realtek_mdio_remove,
+	.shutdown = realtek_mdio_shutdown,
+};
+
+static int rtl8365mb_init(void)
+{
+	int ret;
+
+	ret = realtek_mdio_driver_register(&rtl8365mb_mdio_driver);
+	if (ret)
+		return ret;
+
+	ret = realtek_smi_driver_register(&rtl8365mb_smi_driver);
+	if (ret) {
+		realtek_mdio_driver_unregister(&rtl8365mb_mdio_driver);
+		return ret;
+	}
+
+	return 0;
+}
+module_init(rtl8365mb_init);
+
+static void __exit rtl8365mb_exit(void)
+{
+	realtek_smi_driver_unregister(&rtl8365mb_smi_driver);
+	realtek_mdio_driver_unregister(&rtl8365mb_mdio_driver);
+}
+module_exit(rtl8365mb_exit);
 
 MODULE_AUTHOR("Alvin Šipraga <alsi@bang-olufsen.dk>");
 MODULE_DESCRIPTION("Driver for RTL8365MB-VC ethernet switch");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS(REALTEK_DSA);
