@@ -212,25 +212,25 @@
 		wan-led {
 			gpios = <&gpio4 RK_PA0 GPIO_ACTIVE_HIGH>;
 			label = "green:wan";
-			linux,default-trigger = "dsa-1.0:00:link";
+			linux,default-trigger = "netdev";
 		};
 
 		lan1-led {
 			gpios = <&gpio1 RK_PB0 GPIO_ACTIVE_HIGH>;
 			label = "green:lan1";
-			linux,default-trigger = "dsa-1.0:01:link";
+			linux,default-trigger = "netdev";
 		};
 
 		lan2-led {
 			gpios = <&gpio1 RK_PB1 GPIO_ACTIVE_HIGH>;
 			label = "green:lan2";
-			linux,default-trigger = "dsa-1.0:02:link";
+			linux,default-trigger = "netdev";
 		};
 
 		lan3-led {
 			gpios = <&gpio1 RK_PB4 GPIO_ACTIVE_HIGH>;
 			label = "green:lan3";
-			linux,default-trigger = "dsa-1.0:03:link";
+			linux,default-trigger = "netdev";
 		};
 	};
 

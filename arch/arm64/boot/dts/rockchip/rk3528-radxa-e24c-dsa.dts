@@ -15,12 +15,12 @@
 
 &mdio1 {
 	switch0: switch0@29 {
-		compatible = "realtek,rtl8367rb", "realtek,rtl8365mb";
+		compatible = "realtek,rtl8365mb";
 		#address-cells = <1>;
 		#size-cells = <0>;
-		reg = <29 0>;
-		dsa,member = <1 0>;
-		reset = <&gpio4 RK_PC2 GPIO_ACTIVE_LOW>;
+		reg = <29>;
+		dsa,member = <0 0>;
+		reset-gpios = <&gpio4 RK_PC2 GPIO_ACTIVE_LOW>;
 
 		ports {
 			#address-cells = <1>;
