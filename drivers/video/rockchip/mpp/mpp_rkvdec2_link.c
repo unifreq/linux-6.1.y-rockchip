@@ -1451,8 +1451,10 @@ int rkvdec2_link_wait_result(struct mpp_session *session,
 	struct mpp_task *mpp_task;
 	int ret;
 
+	mutex_lock(&session->lock_session);
 	mpp_task = mpp_session_get_pending_task(session);
 	if (!mpp_task) {
+		mutex_unlock(&session->lock_session);
 		mpp_err("session %p pending list is empty!\n", session);
 		return -EIO;
 	}
@@ -1469,6 +1471,7 @@ int rkvdec2_link_wait_result(struct mpp_session *session,
 		       mpp_task->task_index, mpp_task->state);
 
 	mpp_session_pop_pending(session, mpp_task);
+	mutex_unlock(&session->lock_session);
 	return ret;
 }
 
