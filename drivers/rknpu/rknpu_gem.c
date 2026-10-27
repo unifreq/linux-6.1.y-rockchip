@@ -17,6 +17,8 @@
 #include <linux/pfn_t.h>
 #include <linux/version.h>
 #include <linux/version_compat_defs.h>
+#include <linux/idr.h>
+#include <linux/random.h>
 #include <asm/cacheflush.h>
 
 #if KERNEL_VERSION(5, 10, 0) <= LINUX_VERSION_CODE
@@ -873,6 +875,34 @@ void rknpu_gem_object_destroy(struct rknpu_gem_object *rknpu_obj)
 	rknpu_iommu_domain_put(rknpu_dev);
 }
 
+/*
+ * Userspace refers to RKNPU objects by the obj_addr value that
+ * RKNPU_MEM_CREATE returns; librknnrt passes it back as obj_addr of
+ * RKNPU_MEM_SYNC and task_obj_addr of RKNPU_SUBMIT. That value used to be
+ * the object's kernel address, and the driver dereferenced whatever
+ * userspace passed in (an arbitrary kernel pointer) and leaked kernel
+ * addresses. obj_addr is now the GEM handle that RKNPU_MEM_CREATE already
+ * returns in its handle field, and an incoming value is only accepted if
+ * drm_gem_object_lookup() names an object in the calling DRM file's own
+ * handle table; a value that was never handed to this caller is rejected
+ * with -EINVAL. The ABI is unchanged: userspace treats obj_addr as an
+ * opaque token.
+ */
+struct rknpu_gem_object *rknpu_gem_object_get_by_handle(struct drm_file *file_priv,
+							u64 id)
+{
+	struct drm_gem_object *obj;
+
+	if (!file_priv || id > U32_MAX)
+		return NULL;
+
+	obj = drm_gem_object_lookup(file_priv, (u32)id);
+	if (!obj)
+		return NULL;
+
+	return to_rknpu_obj(obj);
+}
+
 int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 			   struct drm_file *file_priv)
 {
@@ -901,7 +931,7 @@ int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 
 	args->size = rknpu_obj->size;
 	args->sram_size = rknpu_obj->sram_size;
-	args->obj_addr = (__u64)(uintptr_t)rknpu_obj;
+	args->obj_addr = args->handle;
 	args->dma_addr = rknpu_obj->dma_addr;
 
 	return 0;
@@ -1664,12 +1694,11 @@ static int rknpu_cache_sync(struct rknpu_gem_object *rknpu_obj,
 	return 0;
 }
 
-int rknpu_gem_sync_ioctl(struct drm_device *dev, void *data,
-			 struct drm_file *file_priv)
+static int rknpu_gem_sync_obj(struct drm_device *dev,
+			      struct rknpu_gem_object *rknpu_obj,
+			      struct rknpu_mem_sync *args)
 {
-	struct rknpu_gem_object *rknpu_obj = NULL;
 	struct rknpu_device *rknpu_dev = dev->dev_private;
-	struct rknpu_mem_sync *args = data;
 	struct scatterlist *sg;
 	dma_addr_t sg_phys_addr;
 	unsigned long length, offset = 0;
@@ -1677,8 +1706,8 @@ int rknpu_gem_sync_ioctl(struct drm_device *dev, void *data,
 	unsigned long len = 0;
 	int i;
 
-	rknpu_obj = (struct rknpu_gem_object *)(uintptr_t)args->obj_addr;
-	if (!rknpu_obj)
+	if (args->offset > rknpu_obj->size ||
+	    args->size > rknpu_obj->size - args->offset)
 		return -EINVAL;
 
 	if (!(rknpu_obj->flags & RKNPU_MEM_CACHEABLE))
@@ -1754,4 +1783,21 @@ int rknpu_gem_sync_ioctl(struct drm_device *dev, void *data,
 	rknpu_iommu_domain_put(rknpu_dev);
 
 	return 0;
+}
+
+int rknpu_gem_sync_ioctl(struct drm_device *dev, void *data,
+			 struct drm_file *file_priv)
+{
+	struct rknpu_mem_sync *args = data;
+	struct rknpu_gem_object *rknpu_obj;
+	int ret;
+
+	rknpu_obj = rknpu_gem_object_get_by_handle(file_priv, args->obj_addr);
+	if (!rknpu_obj)
+		return -EINVAL;
+
+	ret = rknpu_gem_sync_obj(dev, rknpu_obj, args);
+	rknpu_gem_object_put(&rknpu_obj->base);
+
+	return ret;
 }

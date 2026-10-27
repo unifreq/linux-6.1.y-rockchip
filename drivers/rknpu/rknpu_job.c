@@ -6,6 +6,7 @@
 
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <asm/div64.h>
 #include <linux/sync_file.h>
 #include <linux/io.h>
 
@@ -522,11 +523,44 @@ static int rknpu_schedule_core_index(struct rknpu_device *rknpu_dev)
 	return core_index;
 }
 
+static bool rknpu_task_index_in_bounds(u64 task_obj_size, u32 start, u32 number)
+{
+	u64 end = (u64)start + number;
+
+	return end * sizeof(struct rknpu_task) <= task_obj_size;
+}
+
+/*
+ * A used subcore entry must not make rknpu_job_subcore_commit_pc() touch
+ * anything outside the task object.  A zero-length range still reads
+ * task[start] and task[start - 1], so both have to be in bounds.
+ */
+static bool rknpu_subcore_task_in_bounds(u64 task_obj_size,
+					 const struct rknpu_subcore_task *task)
+{
+	u64 count = task_obj_size;
+
+	/*
+	 * 64-bit division lowers to the libgcc __aeabi_uldivmod helper on
+	 * arm32, which the kernel does not export to modules; do_div() goes
+	 * through the in-kernel 32-bit helper instead.
+	 */
+	do_div(count, sizeof(struct rknpu_task));
+
+	if (task->task_number)
+		return rknpu_task_index_in_bounds(task_obj_size,
+						  task->task_start,
+						  task->task_number);
+
+	return task->task_start > 0 && task->task_start < count;
+}
+
 static void rknpu_job_schedule(struct rknpu_job *job)
 {
 	struct rknpu_device *rknpu_dev = job->rknpu_dev;
 	struct rknpu_subcore_data *subcore_data = NULL;
 	int i = 0, core_index = 0;
+	bool core_auto = false;
 	unsigned long flags;
 
 	if (job->args->core_mask == RKNPU_CORE_AUTO_MASK) {
@@ -535,11 +569,38 @@ static void rknpu_job_schedule(struct rknpu_job *job)
 		job->use_core_num = 1;
 		atomic_set(&job->run_count, job->use_core_num);
 		atomic_set(&job->interrupt_count, job->use_core_num);
+		core_auto = true;
 	}
 
 	if (rknpu_iommu_domain_get_and_switch(rknpu_dev, job->iommu_domain_id)) {
 		job->ret = -EINVAL;
 		return;
+	}
+
+	/*
+	 * The AUTO core is only picked above, so the subcore entry the NPU
+	 * will fetch has not been checked at ioctl time yet.  A job with an
+	 * explicit single-core mask reaches subcore_task[core_index] the
+	 * same way, so the entry picked here gets the same bounds check.
+	 */
+	if (core_auto && rknpu_dev->config->num_irqs > 1) {
+#ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+		struct rknpu_gem_object *task_obj =
+			(struct rknpu_gem_object *)(uintptr_t)
+				job->args->task_obj_addr;
+#endif
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+		struct rknpu_mem_object *task_obj =
+			(struct rknpu_mem_object *)(uintptr_t)
+				job->args->task_obj_addr;
+#endif
+
+		if (task_obj &&
+		    !rknpu_subcore_task_in_bounds(
+			    task_obj->size, &job->args->subcore_task[core_index])) {
+			job->ret = -EINVAL;
+			return;
+		}
 	}
 
 	spin_lock_irqsave(&rknpu_dev->irq_lock, flags);
@@ -851,8 +912,77 @@ int rknpu_submit_ioctl(struct drm_device *dev, void *data,
 {
 	struct rknpu_device *rknpu_dev = dev_get_drvdata(dev->dev);
 	struct rknpu_submit *args = data;
+	struct rknpu_gem_object *task_obj = NULL;
+	u64 obj_id = args->task_obj_addr;
+	int i, ret;
 
-	return rknpu_submit(rknpu_dev, args);
+	/*
+	 * task_obj_addr is the obj_addr token from RKNPU_MEM_CREATE (see
+	 * rknpu_gem_object_get_by_handle()); only an object this file holds a
+	 * handle to is accepted, and the task indices must lie inside it. For
+	 * the duration of the submit the driver works with the object pointer;
+	 * userspace gets its token back. A blocking job is cleaned up before
+	 * rknpu_submit() returns, a non-blocking job keeps its own copy of the
+	 * arguments and its own object reference.
+	 *
+	 * RKNPU_CORE_AUTO_MASK (0) means the core is picked later in
+	 * rknpu_job_schedule(); the subcore entry of the picked core is
+	 * bounds-checked there, so it is not checked here.
+	 */
+	if (obj_id) {
+		task_obj = rknpu_gem_object_get_by_handle(file_priv, obj_id);
+		if (!task_obj)
+			return -EINVAL;
+
+		ret = -EINVAL;
+		if (!task_obj->kv_addr ||
+		    !rknpu_task_index_in_bounds(task_obj->size,
+						args->task_start,
+						args->task_number))
+			goto out_put;
+
+		if (rknpu_dev->config->num_irqs > 1) {
+			int first = -1;
+			int count = 0;
+
+			if (args->core_mask ==
+			    (RKNPU_CORE0_MASK | RKNPU_CORE1_MASK)) {
+				first = 0;
+				count = 2;
+			} else if (args->core_mask ==
+				   (RKNPU_CORE0_MASK | RKNPU_CORE1_MASK |
+				    RKNPU_CORE2_MASK)) {
+				first = 2;
+				count = 3;
+			} else if (args->core_mask == RKNPU_CORE0_MASK) {
+				first = 0;
+				count = 1;
+			} else if (args->core_mask == RKNPU_CORE1_MASK) {
+				first = 1;
+				count = 1;
+			} else if (args->core_mask == RKNPU_CORE2_MASK) {
+				first = 2;
+				count = 1;
+			}
+
+			for (i = first; i >= 0 && i < first + count; i++)
+				if (!rknpu_subcore_task_in_bounds(
+					    task_obj->size,
+					    &args->subcore_task[i]))
+					goto out_put;
+		}
+
+		args->task_obj_addr = (__u64)(uintptr_t)task_obj;
+	}
+
+	ret = rknpu_submit(rknpu_dev, args);
+	args->task_obj_addr = obj_id;
+
+out_put:
+	if (task_obj)
+		rknpu_gem_object_put(&task_obj->base);
+
+	return ret;
 }
 #endif
 
