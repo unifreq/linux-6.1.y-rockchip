@@ -86,6 +86,13 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	char *k_data = (char *)&args;
 	struct iosys_map map = { 0 };
 
+	/* _IOC_SIZE is fully userspace-controlled; anything larger than the
+	 * kernel struct would overflow the stack object below. */
+	if (in_size > k_size) {
+		LOG_ERROR("%s: invalid ioctl size: %u\n", __func__, in_size);
+		return -EINVAL;
+	}
+
 	if (unlikely(copy_from_user(&args, (struct rknpu_mem_create *)data,
 				    in_size))) {
 		LOG_ERROR("%s: copy_from_user failed\n", __func__);
