@@ -26,6 +26,7 @@
 #include <linux/delay.h>
 #include <linux/wait.h>
 #include <linux/sched.h>
+#include <linux/capability.h>
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
 #include <linux/pm_domain.h>
@@ -485,10 +486,22 @@ static int rknpu_action(struct rknpu_device *rknpu_dev,
 		args->value = rknpu_dev->iommu_en;
 		ret = 0;
 		break;
-	case RKNPU_SET_PROC_NICE:
-		set_user_nice(current, *(int32_t *)&args->value);
+	case RKNPU_SET_PROC_NICE: {
+		int nice = *(int32_t *)&args->value;
+
+		/*
+		 * Same restriction as nice(2): raising the priority
+		 * (lowering the nice value) requires CAP_SYS_NICE.
+		 */
+		if (nice < task_nice(current) && !capable(CAP_SYS_NICE)) {
+			ret = -EPERM;
+			break;
+		}
+
+		set_user_nice(current, nice);
 		ret = 0;
 		break;
+	}
 	case RKNPU_GET_TOTAL_SRAM_SIZE:
 		if (rknpu_dev->sram_mm)
 			args->value = rknpu_dev->sram_mm->total_chunks *
