@@ -1134,7 +1134,7 @@
 
 /* ===== PWM Fan Controller ===== */
 &pwm9 {
-	pinctrl-names = "default";
+	pinctrl-names = "active";
 	pinctrl-0 = <&pwm9m1_pins>;
 	status = "okay";
 };
