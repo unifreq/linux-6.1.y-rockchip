@@ -188,6 +188,14 @@
 		rockchip,jack-det;
 		status = "okay";
 	};
+
+	pwm_fan: pwm-fan {
+		compatible = "pwm-fan";
+		pwms = <&pwm9 0 50000 0>;
+		#cooling-cells = <2>;
+		pulses-per-revolution = <2>;
+		status = "okay";
+	};
 };
 
 /* ===== CPU Power ===== */
@@ -1121,5 +1129,12 @@
 };
 
 &rga3_1_mmu {
+	status = "okay";
+};
+
+/* ===== PWM Fan Controller ===== */
+&pwm9 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm9m1_pins>;
 	status = "okay";
 };
