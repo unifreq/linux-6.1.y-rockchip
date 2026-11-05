@@ -163,6 +163,10 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
 
 	job->args = kzalloc(sizeof(*args), GFP_KERNEL);
 	if (!job->args) {
+#ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
+		if (task_obj)
+			rknpu_gem_object_put(&task_obj->base);
+#endif
 		kfree(job);
 		return NULL;
 	}
@@ -835,6 +839,7 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 		if (!in_fence) {
 			LOG_ERROR("invalid fence in fd, fd: %d\n",
 				  args->fence_fd);
+			rknpu_job_free(job);
 			return -EINVAL;
 		}
 		args->fence_fd = -1;
@@ -854,6 +859,7 @@ static int rknpu_submit(struct rknpu_device *rknpu_dev,
 				LOG_ERROR("Error (%d) waiting for fence!\n",
 					  ret);
 
+			rknpu_job_free(job);
 			return ret;
 		}
 #else
