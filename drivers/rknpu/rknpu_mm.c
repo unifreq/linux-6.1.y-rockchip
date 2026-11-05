@@ -45,7 +45,8 @@ int rknpu_mm_create(unsigned int mem_size, unsigned int chunk_size,
 	return 0;
 
 free_mm:
-	kfree(mm);
+	kfree(*mm);
+	*mm = NULL;
 	return ret;
 }
 
