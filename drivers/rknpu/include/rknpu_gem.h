@@ -137,8 +137,6 @@ rknpu_gem_object_find(struct drm_file *filp, unsigned int handle)
 		return NULL;
 	}
 
-	rknpu_gem_object_put(obj);
-
 	return to_rknpu_obj(obj);
 }
 

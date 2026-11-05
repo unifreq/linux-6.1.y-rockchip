@@ -908,10 +908,12 @@ int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 {
 	struct rknpu_mem_create *args = data;
 	struct rknpu_gem_object *rknpu_obj = NULL;
+	bool found = true;
 	int ret = -EINVAL;
 
 	rknpu_obj = rknpu_gem_object_find(file_priv, args->handle);
 	if (!rknpu_obj) {
+		found = false;
 		rknpu_obj = rknpu_gem_object_create(drm, args->flags,
 						    args->size, args->sram_size,
 						    args->iommu_domain_id,
@@ -927,12 +929,13 @@ int rknpu_gem_create_ioctl(struct drm_device *drm, void *data,
 		}
 	}
 
-	// rknpu_gem_object_get(&rknpu_obj->base);
-
 	args->size = rknpu_obj->size;
 	args->sram_size = rknpu_obj->sram_size;
 	args->obj_addr = args->handle;
 	args->dma_addr = rknpu_obj->dma_addr;
+
+	if (found)
+		rknpu_gem_object_put(&rknpu_obj->base);
 
 	return 0;
 }
@@ -971,6 +974,7 @@ int rknpu_gem_destroy_ioctl(struct drm_device *drm, void *data,
 		if (ret && ++wait_count >= 3) {
 			LOG_DEV_ERROR(rknpu_dev->dev,
 				      "failed to destroy memory\n");
+			rknpu_gem_object_put(&rknpu_obj->base);
 			return ret;
 		}
 	} while (ret);
@@ -978,6 +982,7 @@ int rknpu_gem_destroy_ioctl(struct drm_device *drm, void *data,
 	ret = rknpu_gem_handle_destroy(file_priv, args->handle);
 
 	rknpu_iommu_domain_put(rknpu_dev);
+	rknpu_gem_object_put(&rknpu_obj->base);
 
 	return ret;
 }
@@ -1268,14 +1273,19 @@ int rknpu_gem_dumb_map_offset(struct drm_file *file_priv,
 
 	/* Don't allow imported objects to be mapped */
 	obj = &rknpu_obj->base;
-	if (obj->import_attach)
+	if (obj->import_attach) {
+		rknpu_gem_object_put(obj);
 		return -EINVAL;
+	}
 
 	ret = drm_gem_create_mmap_offset(obj);
-	if (ret)
+	if (ret) {
+		rknpu_gem_object_put(obj);
 		return ret;
+	}
 
 	*offset = drm_vma_node_offset_addr(&obj->vma_node);
+	rknpu_gem_object_put(obj);
 
 	return 0;
 }
