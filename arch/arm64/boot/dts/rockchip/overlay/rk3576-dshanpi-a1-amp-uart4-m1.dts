@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ * DshanPI-A1 (RK3576) AMP (MCU) overlay.
+ *
+ * Enables the RK3576 AMP framework with the MCU console on UART4_M1
+ * (GPIO1_C4 = UART4_TX_M1, GPIO1_C5 = UART4_RX_M1), which is routed to the
+ * 40-pin expansion header J15.
+ *
+ * NOTE: UART4_M1 shares GPIO1_C4/C5 with FSPI1_M1, so this overlay and
+ * rk3576-dshanpi-a1-fspi1-spi-nor.dtso are mutually exclusive.
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/clock/rockchip,rk3576-cru.h>
+#include <dt-bindings/soc/rockchip-amp.h>
+
+#define CPU_GET_AFFINITY(cpuId, clusterId) (((cpuId) << 0) | ((clusterId) << 8))
+
+/ {
+	compatible = "rockchip,rk3576-dshanpi-a1", "rockchip,rk3576";
+
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			#address-cells = <2>;
+			#size-cells = <2>;
+
+			rockchip-amp {
+				compatible = "rockchip,amp";
+				clocks = <&cru FCLK_BUS_CM0_CORE>, <&cru CLK_BUS_CM0_RTC>,
+					 <&cru FCLK_PMU_CM0_CORE>, <&cru CLK_PMU_CM0_RTC>,
+					 <&cru PCLK_MAILBOX0>,
+					 <&cru SCLK_UART4>, <&cru PCLK_UART4>,
+					 <&cru PCLK_BUSTIMER1>, <&cru CLK_TIMER10>, <&cru CLK_TIMER11>;
+
+				pinctrl-names = "default";
+				pinctrl-0 = <&uart4m1_xfer>;
+
+				amp-cpu-aff-maskbits = /bits/ 64 <0x0 0x1 0x1 0x2 0x2 0x4 0x3 0x8 0x100 0x10
+								 0x101 0x20 0x102 0x40 0x103 0x80>;
+				amp-irqs = /bits/ 64 <GIC_AMP_IRQ_CFG_ROUTE(113, 0xd0, CPU_GET_AFFINITY(3, 0))
+						      GIC_AMP_IRQ_CFG_ROUTE(174, 0xd0, CPU_GET_AFFINITY(3, 0))>;
+				status = "okay";
+			};
+
+			reserved-memory {
+				#address-cells = <2>;
+				#size-cells = <2>;
+				ranges;
+
+				rpmsg_reserved: rpmsg@47800000 {
+					reg = <0x0 0x47800000 0x0 0x200000>;
+					no-map;
+				};
+
+				rpmsg_dma_reserved: rpmsg-dma@47a00000 {
+					compatible = "shared-dma-pool";
+					reg = <0x0 0x47a00000 0x0 0x200000>;
+					no-map;
+				};
+
+				amp_shmem_reserved: amp-shmem@47c00000 {
+					reg = <0x0 0x47c00000 0x0 0x400000>;
+					no-map;
+				};
+
+				mcu_reserved: mcu@48000000 {
+					reg = <0x0 0x48000000 0x0 0x200000>;
+					no-map;
+				};
+			};
+
+			rpmsg: rpmsg@47800000 {
+				compatible = "rockchip,rpmsg";
+				mbox-names = "rpmsg-rx", "rpmsg-tx";
+				mboxes = <&mailbox0 0 &mailbox3 0>;
+				rockchip,vdev-nums = <1>;
+				/* CPU3: link-id 0x03; MCU: link-id 0x04; */
+				rockchip,link-id = <0x03>;
+				reg = <0x0 0x47800000 0x0 0x20000>;
+				memory-region = <&rpmsg_dma_reserved>;
+
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&mailbox0>;
+
+		__overlay__ {
+			rockchip,txpoll-period-ms = <1>;
+			status = "okay";
+		};
+	};
+
+	fragment@2 {
+		target = <&mailbox3>;
+
+		__overlay__ {
+			rockchip,txpoll-period-ms = <1>;
+			status = "okay";
+		};
+	};
+};

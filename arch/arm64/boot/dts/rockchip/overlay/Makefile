@@ -140,10 +140,12 @@ dtbo-$(CONFIG_ARCH_ROCKCHIP) += \
 	rk3528-rock-2-enable-pcie.dtbo \
 	rk3566-roc-pc-sata2.dtbo \
 	rk3576-can1-m1.dtbo \
+	rk3576-dshanpi-a1-amp-uart4-m1.dtbo \
 	rk3576-dshanpi-a1-csi1-imx415.dtbo \
 	rk3576-dshanpi-a1-csi3-imx415.dtbo \
 	rk3576-dshanpi-a1-dsi480x360-touch.dtbo \
 	rk3576-dshanpi-a1-dsi1024x768-touch.dtbo \
+	rk3576-dshanpi-a1-fspi1-spi-nor.dtbo \
 	rk3576-i2c0-m1.dtbo \
 	rk3576-i2c1-m0.dtbo \
 	rk3576-i2c2-m0.dtbo \

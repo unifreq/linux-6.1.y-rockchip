@@ -1411,12 +1411,6 @@
 	status = "okay";
 };
 
-&uart4 {
-	status = "okay";
-	pinctrl-names = "default";
-	pinctrl-0 = <&uart4m1_xfer>;
-};
-
 /* io: 1v8, to 40p con */
 &uart7 {
 	status = "okay";

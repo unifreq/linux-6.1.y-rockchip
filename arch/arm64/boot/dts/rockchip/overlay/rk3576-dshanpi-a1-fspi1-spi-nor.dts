@@ -1,0 +1,63 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2024 Rockchip Electronics Co., Ltd.
+ *
+ * DshanPI-A1 (RK3576) FSPI1 SPI NOR overlay.
+ *
+ * The board routes FSPI1_M1 (CLK/D0..D3/CSN0) both to the on-board SPI NOR
+ * footprint (U4, not populated on production boards) and to the 40-pin
+ * expansion header J15.  The base DTB therefore leaves &sfc1 disabled; apply
+ * this overlay to enable the SPI NOR flash.
+ *
+ * NOTE: FSPI1_M1 shares GPIO1_C4/C5 with UART4_M1, which is used by the
+ * RK3576 AMP (MCU) firmware.  This overlay and
+ * rk3576-dshanpi-a1-amp-uart4-m1.dtso are mutually exclusive.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "rockchip,rk3576-dshanpi-a1", "rockchip,rk3576";
+
+	fragment@0 {
+		target = <&fspi1m1_pins>;
+
+		__overlay__ {
+			rockchip,pins =
+				/* fspi1_clk_m1 */
+				<1 29 3 &pcfg_pull_none>,
+				/* fspi1_d0_m1 */
+				<1 20 3 &pcfg_pull_none>,
+				/* fspi1_d1_m1 */
+				<1 21 3 &pcfg_pull_none>,
+				/* fspi1_d2_m1 */
+				<1 22 3 &pcfg_pull_none>,
+				/* fspi1_d3_m1 */
+				<1 23 3 &pcfg_pull_none>;
+		};
+	};
+
+	fragment@1 {
+		target = <&sfc1>;
+
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&fspi1m1_csn0 &fspi1m1_pins>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			spi-nor@0 {
+				compatible = "jedec,spi-nor";
+				label = "sfc_nor";
+				reg = <0>;
+				m25p,fast-read;
+				spi-max-frequency = <100000000>;
+				spi-rx-bus-width = <4>;
+				spi-tx-bus-width = <1>;
+				vcc-supply = <&vcc_3v3_s0>;
+			};
+		};
+	};
+};
