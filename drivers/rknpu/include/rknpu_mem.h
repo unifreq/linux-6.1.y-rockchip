@@ -9,6 +9,7 @@
 
 #include <linux/mm_types.h>
 #include <linux/version.h>
+#include <linux/kref.h>
 
 /*
  * rknpu DMA buffer structure.
@@ -24,6 +25,8 @@
  * @sgt: Imported sg_table.
  * @dmabuf: buffer for this attachment.
  * @owner: Is this memory internally allocated.
+ * @refcount: object reference count, one per lookup plus the session one.
+ * @id: per-session token returned to userspace as obj_addr.
  */
 struct rknpu_mem_object {
 	unsigned long flags;
@@ -36,12 +39,20 @@ struct rknpu_mem_object {
 	struct dma_buf_attachment *attachment;
 	struct list_head head;
 	unsigned int owner;
+	struct kref refcount;
+	u32 id;
 };
+
+void rknpu_mem_object_get(struct rknpu_mem_object *rknpu_obj);
+void rknpu_mem_object_put(struct rknpu_mem_object *rknpu_obj);
+struct rknpu_mem_object *rknpu_mem_object_find(struct rknpu_session *session,
+					       u64 id);
 
 int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			   unsigned int cmd, unsigned long data);
 int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			    unsigned long data);
-int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data);
+int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+			 unsigned long data);
 
 #endif

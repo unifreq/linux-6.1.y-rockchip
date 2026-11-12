@@ -180,6 +180,7 @@ struct rknpu_device {
 struct rknpu_session {
 	struct rknpu_device *rknpu_dev;
 	struct list_head list;
+	u32 last_id;
 };
 
 int rknpu_power_get(struct rknpu_device *rknpu_dev);

@@ -17,58 +17,90 @@
 
 #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
 
-#if KERNEL_VERSION(6, 1, 115) < LINUX_VERSION_CODE
-#ifdef CONFIG_ARM64
-/*
- * Check whether a kernel address is valid (derived from arch/x86/).
- */
-static int kern_addr_valid(unsigned long addr)
+static void rknpu_mem_object_release(struct kref *kref)
 {
-	pgd_t *pgdp;
-	p4d_t *p4dp;
-	pud_t *pudp, pud;
-	pmd_t *pmdp, pmd;
-	pte_t *ptep, pte;
+	struct rknpu_mem_object *rknpu_obj =
+		container_of(kref, struct rknpu_mem_object, refcount);
 
-	addr = arch_kasan_reset_tag(addr);
-	if ((((long)addr) >> VA_BITS) != -1UL)
-		return 0;
+	if (rknpu_obj->kv_addr) {
+		struct iosys_map map =
+			IOSYS_MAP_INIT_VADDR(rknpu_obj->kv_addr);
 
-	pgdp = pgd_offset_k(addr);
-	if (pgd_none(READ_ONCE(*pgdp)))
-		return 0;
+		dma_buf_vunmap(rknpu_obj->dmabuf, &map);
+		rknpu_obj->kv_addr = NULL;
+	}
 
-	p4dp = p4d_offset(pgdp, addr);
-	if (p4d_none(READ_ONCE(*p4dp)))
-		return 0;
+	dma_buf_unmap_attachment(rknpu_obj->attachment, rknpu_obj->sgt,
+				 DMA_BIDIRECTIONAL);
+	dma_buf_detach(rknpu_obj->dmabuf, rknpu_obj->attachment);
 
-	pudp = pud_offset(p4dp, addr);
-	pud = READ_ONCE(*pudp);
-	if (pud_none(pud))
-		return 0;
+	if (!rknpu_obj->owner)
+		dma_buf_put(rknpu_obj->dmabuf);
 
-	if (pud_sect(pud))
-		return pfn_valid(pud_pfn(pud));
-
-	pmdp = pmd_offset(pudp, addr);
-	pmd = READ_ONCE(*pmdp);
-	if (pmd_none(pmd))
-		return 0;
-
-	if (pmd_sect(pmd))
-		return pfn_valid(pmd_pfn(pmd));
-
-	ptep = pte_offset_kernel(pmdp, addr);
-	pte = READ_ONCE(*ptep);
-	if (pte_none(pte))
-		return 0;
-
-	return pfn_valid(pte_pfn(pte));
+	kfree(rknpu_obj);
 }
-#else
-#define kern_addr_valid(addr)	(1)
-#endif
-#endif
+
+void rknpu_mem_object_get(struct rknpu_mem_object *rknpu_obj)
+{
+	kref_get(&rknpu_obj->refcount);
+}
+
+void rknpu_mem_object_put(struct rknpu_mem_object *rknpu_obj)
+{
+	kref_put(&rknpu_obj->refcount, rknpu_mem_object_release);
+}
+
+/*
+ * obj_addr is a per-session token, not the object's kernel address: a
+ * lookup only ever returns an object of the calling session, and the
+ * returned reference keeps it alive while the caller uses it.
+ */
+struct rknpu_mem_object *rknpu_mem_object_find(struct rknpu_session *session,
+					       u64 id)
+{
+	struct rknpu_device *rknpu_dev = session->rknpu_dev;
+	struct rknpu_mem_object *entry;
+
+	if (!id || id > U32_MAX)
+		return NULL;
+
+	spin_lock(&rknpu_dev->lock);
+	list_for_each_entry(entry, &session->list, head) {
+		if (entry->id == (u32)id) {
+			rknpu_mem_object_get(entry);
+			spin_unlock(&rknpu_dev->lock);
+			return entry;
+		}
+	}
+	spin_unlock(&rknpu_dev->lock);
+
+	return NULL;
+}
+
+static u32 rknpu_mem_id_alloc(struct rknpu_session *session)
+{
+	struct rknpu_mem_object *entry;
+	bool used;
+	u32 id;
+
+	lockdep_assert_held(&session->rknpu_dev->lock);
+
+	do {
+		id = ++session->last_id;
+		if (!id)
+			continue;
+
+		used = false;
+		list_for_each_entry(entry, &session->list, head) {
+			if (entry->id == id) {
+				used = true;
+				break;
+			}
+		}
+	} while (used);
+
+	return id;
+}
 
 int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			   unsigned int cmd, unsigned long data)
@@ -170,15 +202,29 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	rknpu_obj->sgt = table;
 	rknpu_obj->attachment = attachment;
 
+	spin_lock(&rknpu_dev->lock);
+
+	session = file->private_data;
+	if (session)
+		rknpu_obj->id = rknpu_mem_id_alloc(session);
+
+	spin_unlock(&rknpu_dev->lock);
+
+	if (!session) {
+		ret = -EFAULT;
+		goto err_unmap_kv_addr;
+	}
+
+	kref_init(&rknpu_obj->refcount);
+
 	args.size = rknpu_obj->size;
-	args.obj_addr = (__u64)(uintptr_t)rknpu_obj;
+	args.obj_addr = rknpu_obj->id;
 	args.dma_addr = rknpu_obj->dma_addr;
 	args.handle = fd;
 
-	LOG_DEBUG(
-		"args.handle: %d, args.size: %lld, rknpu_obj: %#llx, rknpu_obj->dma_addr: %#llx\n",
-		args.handle, args.size, (__u64)(uintptr_t)rknpu_obj,
-		(__u64)rknpu_obj->dma_addr);
+	LOG_DEBUG("args.handle: %d, args.size: %lld, id: %u, dma_addr: %#llx\n",
+		  args.handle, args.size, rknpu_obj->id,
+		  (__u64)rknpu_obj->dma_addr);
 
 	if (unlikely(copy_to_user((struct rknpu_mem_create *)data, &args,
 				  in_size))) {
@@ -188,15 +234,7 @@ int rknpu_mem_create_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 	}
 
 	spin_lock(&rknpu_dev->lock);
-
-	session = file->private_data;
-	if (!session) {
-		spin_unlock(&rknpu_dev->lock);
-		ret = -EFAULT;
-		goto err_unmap_kv_addr;
-	}
 	list_add_tail(&rknpu_obj->head, &session->list);
-
 	spin_unlock(&rknpu_dev->lock);
 
 	return 0;
@@ -224,7 +262,7 @@ err_free_obj:
 int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 			    unsigned long data)
 {
-	struct rknpu_mem_object *rknpu_obj, *entry, *q;
+	struct rknpu_mem_object *rknpu_obj;
 	struct rknpu_session *session = NULL;
 	struct rknpu_mem_destroy args;
 	int ret = -EFAULT;
@@ -236,51 +274,31 @@ int rknpu_mem_destroy_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
 		return ret;
 	}
 
-	if (!kern_addr_valid(args.obj_addr)) {
-		LOG_ERROR("%s: invalid obj_addr: %#llx\n", __func__,
-			  (__u64)(uintptr_t)args.obj_addr);
-		ret = -EINVAL;
-		return ret;
-	}
-
-	rknpu_obj = (struct rknpu_mem_object *)(uintptr_t)args.obj_addr;
-	LOG_DEBUG(
-		"free args.handle: %d, rknpu_obj: %#llx, rknpu_obj->dma_addr: %#llx\n",
-		args.handle, (__u64)(uintptr_t)rknpu_obj,
-		(__u64)rknpu_obj->dma_addr);
-
-	spin_lock(&rknpu_dev->lock);
 	session = file->private_data;
 	if (!session) {
-		spin_unlock(&rknpu_dev->lock);
 		ret = -EFAULT;
 		return ret;
 	}
-	list_for_each_entry_safe(entry, q, &session->list, head) {
-		if (entry == rknpu_obj) {
-			list_del(&entry->head);
-			break;
-		}
+
+	rknpu_obj = rknpu_mem_object_find(session, args.obj_addr);
+	if (!rknpu_obj)
+		return -EINVAL;
+
+	LOG_DEBUG("free id: %u, dma_addr: %#llx\n", rknpu_obj->id,
+		  (__u64)rknpu_obj->dma_addr);
+
+	spin_lock(&rknpu_dev->lock);
+	if (list_empty(&rknpu_obj->head)) {
+		/* another thread already destroyed this object */
+		spin_unlock(&rknpu_dev->lock);
+		rknpu_mem_object_put(rknpu_obj);
+		return -EINVAL;
 	}
+	list_del_init(&rknpu_obj->head);
 	spin_unlock(&rknpu_dev->lock);
 
-	if (rknpu_obj == entry) {
-		if (rknpu_obj->kv_addr) {
-			struct iosys_map map =
-				IOSYS_MAP_INIT_VADDR(rknpu_obj->kv_addr);
-			dma_buf_vunmap(rknpu_obj->dmabuf, &map);
-			rknpu_obj->kv_addr = NULL;
-		}
-
-		dma_buf_unmap_attachment(rknpu_obj->attachment, rknpu_obj->sgt,
-					 DMA_BIDIRECTIONAL);
-		dma_buf_detach(rknpu_obj->dmabuf, rknpu_obj->attachment);
-
-		if (!rknpu_obj->owner)
-			dma_buf_put(rknpu_obj->dmabuf);
-
-		kfree(rknpu_obj);
-	}
+	rknpu_mem_object_put(rknpu_obj);
+	rknpu_mem_object_put(rknpu_obj);
 
 	return 0;
 }
@@ -330,9 +348,11 @@ static void __maybe_unused rknpu_dma_buf_sync(
 	}
 }
 
-int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
+int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+			 unsigned long data)
 {
 	struct rknpu_mem_object *rknpu_obj = NULL;
+	struct rknpu_session *session = NULL;
 	struct rknpu_mem_sync args;
 #ifdef CONFIG_DMABUF_PARTIAL
 	struct dma_buf *dmabuf;
@@ -346,14 +366,27 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 		return ret;
 	}
 
-	if (!kern_addr_valid(args.obj_addr)) {
-		LOG_ERROR("%s: invalid obj_addr: %#llx\n", __func__,
-			  (__u64)(uintptr_t)args.obj_addr);
-		ret = -EINVAL;
+	session = file->private_data;
+	if (!session) {
+		ret = -EFAULT;
 		return ret;
 	}
 
-	rknpu_obj = (struct rknpu_mem_object *)(uintptr_t)args.obj_addr;
+	rknpu_obj = rknpu_mem_object_find(session, args.obj_addr);
+	if (!rknpu_obj)
+		return -EINVAL;
+
+	/*
+	 * rknpu_dma_buf_sync() walks the sg_table with u32 offset/length,
+	 * so reject ranges beyond that; the bounds check keeps the sync
+	 * inside the object either way.
+	 */
+	if (args.offset > rknpu_obj->size ||
+	    args.size > rknpu_obj->size - args.offset ||
+	    args.offset > U32_MAX || args.size > U32_MAX) {
+		rknpu_mem_object_put(rknpu_obj);
+		return -EINVAL;
+	}
 
 #ifndef CONFIG_DMABUF_PARTIAL
 	if (args.flags & RKNPU_MEM_SYNC_TO_DEVICE) {
@@ -375,6 +408,8 @@ int rknpu_mem_sync_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 						      args.offset, args.size);
 	}
 #endif
+
+	rknpu_mem_object_put(rknpu_obj);
 
 	return 0;
 }

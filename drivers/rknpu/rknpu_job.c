@@ -101,6 +101,14 @@ static void rknpu_job_free(struct rknpu_job *job)
 	if (task_obj)
 		rknpu_gem_object_put(&task_obj->base);
 #endif
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+	struct rknpu_mem_object *task_obj = NULL;
+
+	task_obj =
+		(struct rknpu_mem_object *)(uintptr_t)job->args->task_obj_addr;
+	if (task_obj)
+		rknpu_mem_object_put(task_obj);
+#endif
 
 	if (job->fence)
 		dma_fence_put(job->fence);
@@ -134,6 +142,9 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
 	struct rknpu_gem_object *task_obj = NULL;
 #endif
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+	struct rknpu_mem_object *task_obj = NULL;
+#endif
 
 	job = kzalloc(sizeof(*job), GFP_KERNEL);
 	if (!job)
@@ -154,6 +165,11 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
 	if (task_obj)
 		rknpu_gem_object_get(&task_obj->base);
 #endif
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+	task_obj = (struct rknpu_mem_object *)(uintptr_t)args->task_obj_addr;
+	if (task_obj)
+		rknpu_mem_object_get(task_obj);
+#endif
 
 	if (!(args->flags & RKNPU_JOB_NONBLOCK)) {
 		job->args = args;
@@ -166,6 +182,10 @@ static inline struct rknpu_job *rknpu_job_alloc(struct rknpu_device *rknpu_dev,
 #ifdef CONFIG_ROCKCHIP_RKNPU_DRM_GEM
 		if (task_obj)
 			rknpu_gem_object_put(&task_obj->base);
+#endif
+#ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
+		if (task_obj)
+			rknpu_mem_object_put(task_obj);
 #endif
 		kfree(job);
 		return NULL;
@@ -993,10 +1013,14 @@ out_put:
 #endif
 
 #ifdef CONFIG_ROCKCHIP_RKNPU_DMA_HEAP
-int rknpu_submit_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
+int rknpu_submit_ioctl(struct rknpu_device *rknpu_dev, struct file *file,
+		       unsigned long data)
 {
+	struct rknpu_session *session = NULL;
+	struct rknpu_mem_object *task_obj = NULL;
 	struct rknpu_submit args;
-	int ret = -EINVAL;
+	u64 obj_id = 0;
+	int i, ret = -EINVAL;
 
 	if (unlikely(copy_from_user(&args, (struct rknpu_submit *)data,
 				    sizeof(struct rknpu_submit)))) {
@@ -1005,7 +1029,67 @@ int rknpu_submit_ioctl(struct rknpu_device *rknpu_dev, unsigned long data)
 		return ret;
 	}
 
+	/*
+	 * task_obj_addr is a per-session token from RKNPU_MEM_CREATE, not a
+	 * kernel pointer; the reference is held while the job may still use
+	 * the object and userspace gets its token back.
+	 */
+	obj_id = args.task_obj_addr;
+	if (obj_id) {
+		session = file->private_data;
+		if (!session)
+			return -EINVAL;
+
+		task_obj = rknpu_mem_object_find(session, obj_id);
+		if (!task_obj)
+			return -EINVAL;
+
+		if (!task_obj->kv_addr ||
+		    !rknpu_task_index_in_bounds(task_obj->size,
+						args.task_start,
+						args.task_number))
+			goto out_put;
+
+		if (rknpu_dev->config->num_irqs > 1) {
+			int first = -1;
+			int count = 0;
+
+			if (args.core_mask ==
+			    (RKNPU_CORE0_MASK | RKNPU_CORE1_MASK)) {
+				first = 0;
+				count = 2;
+			} else if (args.core_mask ==
+				   (RKNPU_CORE0_MASK | RKNPU_CORE1_MASK |
+				    RKNPU_CORE2_MASK)) {
+				first = 2;
+				count = 3;
+			} else if (args.core_mask == RKNPU_CORE0_MASK) {
+				first = 0;
+				count = 1;
+			} else if (args.core_mask == RKNPU_CORE1_MASK) {
+				first = 1;
+				count = 1;
+			} else if (args.core_mask == RKNPU_CORE2_MASK) {
+				first = 2;
+				count = 1;
+			}
+
+			for (i = first; i >= 0 && i < first + count; i++)
+				if (!rknpu_subcore_task_in_bounds(
+					    task_obj->size,
+					    &args.subcore_task[i]))
+					goto out_put;
+		}
+
+		args.task_obj_addr = (__u64)(uintptr_t)task_obj;
+	}
+
 	ret = rknpu_submit(rknpu_dev, &args);
+	args.task_obj_addr = obj_id;
+
+out_put:
+	if (task_obj)
+		rknpu_mem_object_put(task_obj);
 
 	if (unlikely(copy_to_user((struct rknpu_submit *)data, &args,
 				  sizeof(struct rknpu_submit)))) {

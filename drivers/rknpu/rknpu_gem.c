@@ -71,7 +71,7 @@ static int rknpu_gem_get_pages(struct rknpu_gem_object *rknpu_obj)
 	if (ret == 0) {
 		ret = -EFAULT;
 		LOG_DEV_ERROR(drm->dev, "%s: dma map %zu fail\n", __func__,
-			      rknpu_obj->size);
+			      (size_t)rknpu_obj->size);
 		goto free_sgt;
 	}
 	iommu_flush_iotlb_all(iommu_get_domain_for_dev(drm->dev));
@@ -745,7 +745,8 @@ rknpu_gem_object_create(struct drm_device *drm, unsigned int flags,
 					rknpu_dev->sram_mm->chunk_size;
 				LOG_WARN(
 					"mm allocate %zu failed, ret: %d, free size: %zu\n",
-					real_sram_size, ret, sram_free_size);
+					(size_t)real_sram_size, ret,
+					(size_t)sram_free_size);
 				real_sram_size = 0;
 			}
 		}
@@ -1598,9 +1599,15 @@ static int rknpu_cache_sync_with_sg(struct rknpu_device *rknpu_dev,
 				       *length :
 				       s->length - *offset;
 		if (dir & RKNPU_MEM_SYNC_TO_DEVICE) {
-#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE && defined(CONFIG_ARM64)
 			__dma_map_area(cache_start, cache_length,
 				       DMA_TO_DEVICE);
+#elif KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+			/*
+			 * arm32 pre-6.1: no exported per-direction cache
+			 * helper exists and no in-scope SoC carries NPU
+			 * SRAM/NBUF, so the raw sync is compiled out.
+			 */
 #else
 			dcache_clean_poc((unsigned long)cache_start,
 					 (unsigned long)cache_start +
@@ -1609,9 +1616,15 @@ static int rknpu_cache_sync_with_sg(struct rknpu_device *rknpu_dev,
 		}
 
 		if (dir & RKNPU_MEM_SYNC_FROM_DEVICE) {
-#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE && defined(CONFIG_ARM64)
 			__dma_unmap_area(cache_start, cache_length,
 					 DMA_FROM_DEVICE);
+#elif KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+			/*
+			 * arm32 pre-6.1: no exported per-direction cache
+			 * helper exists and no in-scope SoC carries NPU
+			 * SRAM/NBUF, so the raw sync is compiled out.
+			 */
 #else
 			dcache_inval_poc((unsigned long)cache_start,
 					 (unsigned long)cache_start +
@@ -1671,9 +1684,15 @@ static int rknpu_cache_sync(struct rknpu_gem_object *rknpu_obj,
 				       *length :
 				       cache_size - *offset;
 		if (dir & RKNPU_MEM_SYNC_TO_DEVICE) {
-#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE && defined(CONFIG_ARM64)
 			__dma_map_area(cache_start, cache_length,
 				       DMA_TO_DEVICE);
+#elif KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+			/*
+			 * arm32 pre-6.1: no exported per-direction cache
+			 * helper exists and no in-scope SoC carries NPU
+			 * SRAM/NBUF, so the raw sync is compiled out.
+			 */
 #else
 			dcache_clean_poc((unsigned long)cache_start,
 					 (unsigned long)cache_start +
@@ -1682,9 +1701,15 @@ static int rknpu_cache_sync(struct rknpu_gem_object *rknpu_obj,
 		}
 
 		if (dir & RKNPU_MEM_SYNC_FROM_DEVICE) {
-#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+#if KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE && defined(CONFIG_ARM64)
 			__dma_unmap_area(cache_start, cache_length,
 					 DMA_FROM_DEVICE);
+#elif KERNEL_VERSION(6, 1, 0) > LINUX_VERSION_CODE
+			/*
+			 * arm32 pre-6.1: no exported per-direction cache
+			 * helper exists and no in-scope SoC carries NPU
+			 * SRAM/NBUF, so the raw sync is compiled out.
+			 */
 #else
 			dcache_inval_poc((unsigned long)cache_start,
 					 (unsigned long)cache_start +
