@@ -437,7 +437,8 @@ static int rknpu_action(struct rknpu_device *rknpu_dev,
 		break;
 	case RKNPU_GET_VOLT:
 #ifndef FPGA_PLATFORM
-		args->value = regulator_get_voltage(rknpu_dev->vdd);
+		args->value = rknpu_dev->vdd ?
+			      regulator_get_voltage(rknpu_dev->vdd) : 0;
 #endif
 		ret = 0;
 		break;

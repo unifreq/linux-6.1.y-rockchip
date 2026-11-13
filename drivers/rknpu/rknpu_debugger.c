@@ -252,7 +252,8 @@ static int rknpu_volt_show(struct seq_file *m, void *data)
 		container_of(debugger, struct rknpu_device, debugger);
 	unsigned long current_volt = 0;
 
-	current_volt = regulator_get_voltage(rknpu_dev->vdd);
+	if (rknpu_dev->vdd)
+		current_volt = regulator_get_voltage(rknpu_dev->vdd);
 
 	seq_printf(m, "%lu\n", current_volt);
 
