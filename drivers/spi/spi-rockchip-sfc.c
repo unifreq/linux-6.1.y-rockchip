@@ -97,9 +97,9 @@
 #define  SFC_FSR_TX_IS_EMPTY		BIT(1)
 #define  SFC_FSR_RX_IS_EMPTY		BIT(2)
 #define  SFC_FSR_RX_IS_FULL		BIT(3)
-#define  SFC_FSR_TXLV_MASK		GENMASK(13, 8)
+#define  SFC_FSR_TXLV_MASK		GENMASK(14, 8)
 #define  SFC_FSR_TXLV_SHIFT		8
-#define  SFC_FSR_RXLV_MASK		GENMASK(20, 16)
+#define  SFC_FSR_RXLV_MASK		GENMASK(21, 16)
 #define  SFC_FSR_RXLV_SHIFT		16
 
 /* FSM status */
