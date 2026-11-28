@@ -1,0 +1,601 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2026 allonmymind
+ *
+ * CX3566-Z: RK3566 industrial mini host (2GB LPDDR4X, 16GB eMMC),
+ * based on the RK3566 EVB2 LP4X V10 reference design. Everything
+ * board-specific is applied below as overrides on top of the EVB2
+ * device tree.
+ */
+
+/dts-v1/;
+
+#include "rk3566-evb2-lp4x-v10.dtsi"
+#include "rk3568-android.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/clock/rk3568-cru.h>
+#include <dt-bindings/power/rk3568-power.h>
+
+/ {
+	model = "CX3566-Z (RK3566)";
+	compatible = "rockchip,rk3566-evb2-lp4x-v10", "rockchip,rk3566";
+
+	aliases {
+		/* The board has a single MAC (gmac1). */
+		ethernet0 = &gmac1;
+		/delete-property/ ethernet1;
+		/* eMMC first, then TF card, then the SDIO WiFi. */
+		mmc0 = &sdhci;
+		mmc1 = &sdmmc0;
+		mmc2 = &sdmmc1;
+	};
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0xfe660000 console=ttyFIQ0,1500000 rootwait";
+	};
+
+	ext_cam_clk: external-camera-clock {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "CLK_CAMERA_24MHZ";
+	};
+
+	leds-board {
+		compatible = "gpio-leds";
+
+		status-blue {
+			label = "blue:status";
+			gpios = <&gpio0 RK_PD6 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "heartbeat";
+			default-state = "on";
+		};
+	};
+
+	vcc5v0_vbus: vcc5v0-vbus {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc5v0_vbus";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+		enable-active-high;
+		gpio = <&gpio3 RK_PC7 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&vcc5v0_vbus_en>;
+		regulator-always-on;
+		regulator-boot-on;
+	};
+
+	/* No SPDIF output on this board. */
+	spdif-sound {
+		status = "disabled";
+	};
+
+	/* No OP-TEE / vendor storage partitions on this board. */
+	firmware {
+		/delete-node/ optee;
+	};
+
+	/delete-node/ vendor-storage;
+};
+
+&reserved_memory {
+	/delete-node/ linux,cma;
+	/delete-node/ vendor-storage-rm@00000000;
+};
+
+/* The EVB user keys and work LED are not populated. */
+&adc_keys {
+	status = "disabled";
+};
+
+&leds {
+	status = "disabled";
+};
+
+/*
+ * PMU io-domains: VCCIO4/5/6 run from the RK809 DCDC_REG5 rail
+ * (vcc_1v8), not from vcc_3v3 as on the EVB. With the EVB selection
+ * the Ethernet PHY and the SDIO rails are not powered correctly.
+ */
+&pmu_io_domains {
+	vccio4-supply = <&vcc_1v8>;
+	vccio5-supply = <&vcc_1v8>;
+	vccio6-supply = <&vcc_1v8>;
+};
+
+/* VCCIO1 (vccio_acodec) runs at 3.3V on this board. */
+&vccio_acodec {
+	regulator-min-microvolt = <3300000>;
+	regulator-max-microvolt = <3300000>;
+};
+
+/*
+ * USB port power: the per-port power switches and the hub power
+ * enable are tied on through GPIO hogs on GPIO3.
+ */
+&gpio3 {
+	usb-otg-vbus-hog {
+		gpio-hog;
+		gpios = <26 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb-otg-vbus";
+	};
+
+	usb-host-pwren-hog {
+		gpio-hog;
+		gpios = <27 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb-host-pwren";
+	};
+
+	usb-hub-pwren-hog {
+		gpio-hog;
+		gpios = <28 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb-hub-pwren";
+	};
+
+	usb-host3-pwren-hog {
+		gpio-hog;
+		gpios = <29 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb-host3-pwren";
+	};
+};
+
+/*
+ * Ethernet: the RGMII PHY (Maxio MAE0621A) is wired to the gmac1
+ * m0 pin group (GPIO3) instead of the EVB's m1 group (GPIO4), and
+ * the PHY reset line is GPIO4_C2.
+ */
+&gmac1 {
+	pinctrl-0 = <&gmac1m0_miim &gmac1m0_tx_bus2 &gmac1m0_rx_bus2
+		     &gmac1m0_rgmii_clk &gmac1m0_rgmii_bus>;
+	snps,reset-gpio = <&gpio4 RK_PC2 GPIO_ACTIVE_LOW>;
+};
+
+&gmac1_clkin {
+	clock-frequency = <50000000>;
+};
+
+&rgmii_phy0 {
+	/* green: link/activity, orange: 1000M only */
+	maxio,led-data = <0x0368>;
+};
+
+/* The vendor tree does not use the CPU high-temperature OPP guard. */
+&cpu0_opp_table {
+	/delete-property/ rockchip,high-temp;
+	/delete-property/ rockchip,high-temp-max-volt;
+};
+
+/*
+ * GPU operating points for this board's chip binning
+ * (bin=0, leakage=7: the vendor L2 column), as single voltages
+ * instead of the leakage-indexed L0-L3 tables.
+ */
+&gpu_opp_table {
+	opp-200000000 {
+		opp-microvolt = <850000>;
+	};
+
+	opp-300000000 {
+		opp-microvolt = <850000>;
+	};
+
+	opp-400000000 {
+		opp-microvolt = <850000>;
+	};
+
+	opp-600000000 {
+		opp-microvolt = <850000>;
+		/delete-property/ opp-microvolt-L0;
+		/delete-property/ opp-microvolt-L1;
+		/delete-property/ opp-microvolt-L2;
+		/delete-property/ opp-microvolt-L3;
+	};
+
+	opp-700000000 {
+		opp-microvolt = <900000>;
+		/delete-property/ opp-microvolt-L0;
+		/delete-property/ opp-microvolt-L1;
+		/delete-property/ opp-microvolt-L2;
+		/delete-property/ opp-microvolt-L3;
+	};
+
+	opp-800000000 {
+		opp-microvolt = <950000>;
+		/delete-property/ opp-microvolt-L0;
+		/delete-property/ opp-microvolt-L1;
+		/delete-property/ opp-microvolt-L2;
+		/delete-property/ opp-microvolt-L3;
+	};
+};
+
+/* Additional UARTs routed out on this board. */
+&uart0 {
+	status = "okay";
+};
+
+&uart3 {
+	status = "okay";
+};
+
+&uart5 {
+	pinctrl-0 = <&uart5m1_xfer>;
+	status = "okay";
+};
+
+&uart7 {
+	pinctrl-0 = <&uart7m2_xfer>;
+	status = "okay";
+};
+
+&uart9 {
+	pinctrl-0 = <&uart9m2_xfer>;
+	status = "okay";
+};
+
+&pwm0 {
+	status = "okay";
+};
+
+/* The IR receiver is on pwm3 on this board (the EVB uses pwm7). */
+&pwm3 {
+	compatible = "rockchip,remotectl-pwm";
+	remote_pwm_id = <3>;
+	handle_cpu_id = <1>;
+	remote_support_psci = <0>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm3_pins>;
+	status = "okay";
+
+	ir_key1 {
+		rockchip,usercode = <0xff00>;
+		rockchip,key_table =
+			<0xba KEY_POWER>,
+			<0xb8 KEY_HOMEPAGE>,
+			<0xbf KEY_UP>,
+			<0xe6 KEY_DOWN>,
+			<0xf8 KEY_LEFT>,
+			<0xf6 KEY_RIGHT>,
+			<0xea KEY_ENTER>,
+			<0xf7 KEY_MENU>,
+			<0xa5 KEY_BACK>;
+	};
+
+	ir_key2 {
+		rockchip,usercode = <0x7f80>;
+		rockchip,key_table =
+			<0xed KEY_POWER>,
+			<0xe1 KEY_HOMEPAGE>,
+			<0xfd KEY_UP>,
+			<0xf7 KEY_DOWN>,
+			<0xfb KEY_LEFT>,
+			<0xf9 KEY_RIGHT>,
+			<0xfa KEY_ENTER>,
+			<0xf5 KEY_MENU>,
+			<0xe0 KEY_BACK>;
+	};
+
+	ir_key3 {
+		rockchip,usercode = <0xfe01>;
+		rockchip,key_table =
+			<0xe5 KEY_POWER>,
+			<0xe4 KEY_BACK>,
+			<0xe7 KEY_HOMEPAGE>,
+			<0xe0 KEY_UP>,
+			<0xf9 KEY_DOWN>,
+			<0xfc KEY_LEFT>,
+			<0xff KEY_RIGHT>,
+			<0xfd KEY_ENTER>,
+			<0xe1 KEY_MENU>;
+	};
+};
+
+&pwm6 {
+	status = "okay";
+};
+
+&pwm7 {
+	compatible = "rockchip,rk3568-pwm", "rockchip,rk3328-pwm";
+	/delete-property/ remote_pwm_id;
+	/delete-property/ handle_cpu_id;
+	/delete-property/ remote_support_psci;
+	pinctrl-names = "active";
+	status = "disabled";
+
+	/delete-node/ ir_key1;
+	/delete-node/ ir_key2;
+	/delete-node/ ir_key3;
+};
+
+/* The PCIe slot has no separate 3.3V regulator enable. */
+&pcie2x1 {
+	/delete-property/ vpcie3v3-supply;
+};
+
+/* Display: HDMI only; the MIPI-DSI0 and SPDIF paths are unused. */
+&dsi0 {
+	status = "disabled";
+};
+
+&dsi1 {
+	panel@0 {
+		status = "disabled";
+	};
+};
+
+&edp {
+	force-hpd;
+};
+
+&vop {
+	/delete-property/ support-multi-area;
+	disable-win-move;
+
+	ports {
+		port@0 {
+			cursor-win-id = <0>;
+		};
+	};
+};
+
+&spdif_8ch {
+	status = "disabled";
+};
+
+&spdif_out {
+	status = "disabled";
+};
+
+/*
+ * AIC8800DC SDIO WiFi: power is sequenced by the mmc-pwrseq node;
+ * the module VBAT enable is GPIO3_D1 (the EVB's poweren GPIO on
+ * GPIO2 is not used).
+ */
+&wireless_wlan {
+	/delete-property/ WIFI,poweren_gpio;
+	WIFI,vbat_gpio = <&gpio3 RK_PD1 GPIO_ACTIVE_HIGH>;
+};
+
+&wireless_bluetooth {
+	/delete-property/ bt_port;
+};
+
+&pinctrl {
+	usb {
+		vcc5v0_vbus_en: vcc5v0-vbus-en {
+			rockchip,pins = <3 RK_PC7 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+/*
+ * The vcc5v0_otg enable group is not used (the regulator is
+ * hard-wired), but the vendor tree parks it on the OTG VBUS hog
+ * pin GPIO3_D2.
+ */
+&vcc5v0_otg_en {
+	rockchip,pins = <3 RK_PD2 RK_FUNC_GPIO &pcfg_pull_none>;
+};
+
+/* RK809 codec: external amplifier with its own control GPIO. */
+&rk809_codec {
+	/delete-property/ mic-in-differential;
+	/delete-property/ spk-volume;
+	use-ext-amplifier;
+	spk-ctl-gpios = <&gpio4 RK_PC4 GPIO_ACTIVE_HIGH>;
+};
+
+&rk809_sound {
+	hp-det-gpio = <&gpio0 RK_PC6 GPIO_ACTIVE_HIGH>;
+};
+
+&hp_det {
+	rockchip,pins = <0 RK_PC6 RK_FUNC_GPIO &pcfg_pull_up>;
+};
+
+/*
+ * RK809: the sleep pin function is selected through the PMIC's own
+ * pinctrl device, in addition to the SoC-side slppin groups.
+ */
+&rk809 {
+	pinctrl-1 = <&soc_slppin_slp &rk817_slppin_slp>;
+	pinctrl-2 = <&soc_slppin_gpio &rk817_slppin_pwrdn>;
+	pinctrl-3 = <&soc_slppin_gpio &rk817_slppin_rst>;
+
+	pinctrl_rk8xx {
+		gpio-controller;
+		#gpio-cells = <2>;
+
+		rk817_slppin_null {
+			pins = "gpio_slp";
+			function = "pin_fun0";
+		};
+
+		rk817_slppin_slp: rk817_slppin_slp {
+			pins = "gpio_slp";
+			function = "pin_fun1";
+		};
+
+		rk817_slppin_pwrdn: rk817_slppin_pwrdn {
+			pins = "gpio_slp";
+			function = "pin_fun2";
+		};
+
+		rk817_slppin_rst: rk817_slppin_rst {
+			pins = "gpio_slp";
+			function = "pin_fun3";
+		};
+	};
+};
+
+/*
+ * These fixed regulators are hard-wired on this board; the EVB's
+ * GPIO enables are not connected.
+ */
+&vcc_camera {
+	/delete-property/ gpio;
+	/delete-property/ pinctrl-names;
+	/delete-property/ pinctrl-0;
+};
+
+&vcc3v3_lcd0_n {
+	/delete-property/ gpio;
+};
+
+&vcc3v3_lcd1_n {
+	/delete-property/ gpio;
+};
+
+&vcc5v0_otg {
+	/delete-property/ gpio;
+	/delete-property/ pinctrl-names;
+	/delete-property/ pinctrl-0;
+};
+
+/* The EVB's GT1X / Hynitron touch controllers are not populated. */
+&gt1x {
+	status = "disabled";
+};
+
+&hynitron {
+	status = "disabled";
+};
+
+&i2c1 {
+	at24@50 {
+		compatible = "24c32";
+		reg = <0x50>;
+		status = "okay";
+	};
+
+	at8563@51 {
+		compatible = "AnalogTek,AT8563";
+		reg = <0x51>;
+		#clock-cells = <0>;
+		clock-frequency = <32768>;
+		clock-output-names = "AT8563";
+		status = "okay";
+	};
+
+	gt9xx@14 {
+		compatible = "goodix,gt9xx";
+		reg = <0x14>;
+		status = "okay";
+		touchscreen-max-id = <11>;
+		touchscreen-size-x = <0>;
+		touchscreen-size-y = <0>;
+		touchscreen-max-w = <512>;
+		touchscreen-max-p = <512>;
+		goodix,driver-send-cfg = <0>;
+		/* as shipped in the vendor tree (sic) */
+		oodix,auto-update = <0>;
+		goodix,auto-update-cfg = <0>;
+		goodix,cfg-group0 = [53 d0 02 00 05 05 f5 d5 21 48 2d 0f
+				     5a 41 0e 05 00 00 32 32 20 00 05 14
+				     14 1a 14 8b 2b 00];
+		goodix,esd-protect = <1>;
+		goodix,int-sync = <1>;
+		goodix,pen-suppress-finger = <0>;
+		goodix,power-off-sleep = <0>;
+		goodix,resume-in-workqueue = <0>;
+		goodix,reverse-x = <0>;
+		goodix,reverse-y = <0>;
+		goodix,slide-wakeup = <0>;
+		goodix,swap-x2y = <0>;
+		goodix,type-a-report = <0>;
+	};
+
+	ilitek@41 {
+		compatible = "tchip,ilitek";
+		reg = <0x41>;
+		status = "okay";
+	};
+};
+
+/* The EVB camera actuators/sensors below are not populated. */
+&dw9714 {
+	status = "disabled";
+};
+
+&gc5025 {
+	status = "disabled";
+};
+
+&gc8034 {
+	status = "disabled";
+};
+
+&ov5695 {
+	status = "disabled";
+};
+
+&i2c2 {
+	bma250@18 {
+		compatible = "bma2xx_acc";
+		reg = <0x18>;
+		type = <2>;
+		layout = <8>;
+		irq_enable = <0>;
+		poll_delay_ms = <30>;
+		status = "okay";
+	};
+
+	ov13850@10 {
+		compatible = "ovti,ov13850";
+		reg = <0x10>;
+		clocks = <&cru CLK_CAM0_OUT>;
+		clock-names = "xvclk";
+		pinctrl-names = "default";
+		pinctrl-0 = <&cam_clkout0>;
+		power-domains = <&power RK3568_PD_VI>;
+		power-gpios = <&gpio3 RK_PC6 GPIO_ACTIVE_HIGH>;
+		pwdn-gpios = <&gpio3 RK_PD0 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio4 RK_PB1 GPIO_ACTIVE_HIGH>;
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "ZC-OV13850R2A-V1";
+		rockchip,camera-module-lens-name = "Largan-50064B31";
+		status = "okay";
+
+		port {
+			ov13850_out: endpoint {
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&csi2_dphy0_in>;
+			};
+		};
+	};
+};
+
+&csi2_dphy0 {
+	ports {
+		port@0 {
+			csi2_dphy0_in: endpoint@0 {
+				reg = <0>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&ov13850_out>;
+			};
+		};
+	};
+};
+
+/* The camera chain runs 4 lanes wide on this board. */
+&rkcif_mipi_lvds {
+	port {
+		endpoint {
+			data-lanes = <1 2 3 4>;
+		};
+	};
+};
+
+/* I2C5 and its accelerometer are not routed on this board. */
+&i2c5 {
+	status = "disabled";
+};
+
+&mxc6655xa {
+	status = "disabled";
+};
