@@ -195,6 +195,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3562-tl3562-minievm-u-boot.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3562-toybrick-android.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3562-toybrick-linux.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-box-demo-v10.dtb
+dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-cx3566-z.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-evb1-ddr4-v10.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-evb1-ddr4-v10-linux.dtb
 dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3566-evb1-ddr4-v10-lvds.dtb
